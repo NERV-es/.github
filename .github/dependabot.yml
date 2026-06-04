@@ -1,0 +1,14 @@
+# Org-wide Dependabot baseline for NERV-es.
+# A repo can override by committing its own .github/dependabot.yml.
+version: 2
+updates:
+  # GitHub Actions — keep workflow action pins current across every repo.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns: ["*"]

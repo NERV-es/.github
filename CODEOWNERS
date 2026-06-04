@@ -1,0 +1,3 @@
+# Org-wide default code owners for NERV-es.
+# Inherited by any repo that doesn't define its own .github/CODEOWNERS.
+* @bobby-claw
