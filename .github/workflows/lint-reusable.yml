@@ -1,0 +1,181 @@
+# Reusable quality workflow — the CI twin of NERV's ops/scripts/quality/lint-multi.sh.
+#
+# ONE definition, hosted here in the PUBLIC NERV-es/.github org repo so every
+# repo in the org (public or private) can call it with no extra access toggle.
+# Each caller adds an 8-line stub (.github/workflows/quality.yml) that never changes:
+#
+#   jobs:
+#     quality:
+#       uses: NERV-es/.github/.github/workflows/lint-reusable.yml@ci-quality-v1
+#
+# (The doubled `.github/.github/` is correct: the first is the repo named `.github`,
+#  the second is its workflows directory. Pin to the immutable tag, not @main.)
+#
+# A `detect` job globs the checked-out tree and toggles per-language jobs, so the
+# same stub does the right thing in a Swift repo, a Rust/Tauri repo, a TS repo,
+# etc. — zero per-repo config. Swift runs on macos-latest; everything else on
+# ubuntu. Public repos get unlimited free minutes, so the macOS cost is moot.
+#
+# Default posture is ADVISORY (matches the local hook): style findings annotate
+# the PR but don't fail it. Pass strict:true to hard-fail. Secret detection
+# (gitleaks) ALWAYS fails — a leak is never advisory.
+name: lint-reusable
+
+on:
+  workflow_call:
+    inputs:
+      strict:
+        description: "Fail the check on lint findings (secrets always fail)."
+        type: boolean
+        default: false
+      swift_strict:
+        description: "Run SwiftLint in --strict (any warning fails). Overrides strict for Swift."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── detect which languages are present (drives the conditional jobs) ────────
+  detect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      swift: ${{ steps.d.outputs.swift }}
+      python: ${{ steps.d.outputs.python }}
+      js: ${{ steps.d.outputs.js }}
+      shell: ${{ steps.d.outputs.shell }}
+      yaml: ${{ steps.d.outputs.yaml }}
+      cpp: ${{ steps.d.outputs.cpp }}
+      rust: ${{ steps.d.outputs.rust }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: d
+        shell: bash
+        run: |
+          set -euo pipefail
+          # prune vendored/generated trees so a bundled whisper.cpp etc. doesn't
+          # force a C/C++ job the repo doesn't actually own.
+          PRUNE='-path */node_modules/* -o -path */Pods/* -o -path */.build/* -o -path */build/* -o -path */target/* -o -path */DerivedData/* -o -path */dist/* -o -path */vendor/* -o -path */third_party/* -o -path */whisper.cpp/*'
+          has(){ # $1 = -name expr(s) already formed
+            local n; n=$(eval "find . -type d \\( $PRUNE \\) -prune -o -type f \\( $1 \\) -print" 2>/dev/null | head -1)
+            [ -n "$n" ] && echo true || echo false; }
+          {
+            echo "swift=$(has '-name *.swift')"
+            echo "python=$(has '-name *.py')"
+            echo "js=$(has '-name *.js -o -name *.jsx -o -name *.ts -o -name *.tsx')"
+            echo "shell=$(has '-name *.sh -o -name *.bash')"
+            echo "yaml=$(has '-name *.yml -o -name *.yaml')"
+            echo "cpp=$(has '-name *.c -o -name *.cc -o -name *.cpp -o -name *.cxx -o -name *.mm')"
+            echo "rust=$(has '-name *.rs')"
+          } >> "$GITHUB_OUTPUT"
+          echo "── detected ──"; cat "$GITHUB_OUTPUT"
+
+  swift:
+    needs: detect
+    if: needs.detect.outputs.swift == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: SwiftLint
+        run: |
+          command -v swiftlint >/dev/null || brew install swiftlint
+          swiftlint version
+          if [ "${{ inputs.swift_strict }}" = "true" ]; then
+            swiftlint --strict --reporter github-actions-logging
+          elif [ "${{ inputs.strict }}" = "true" ]; then
+            swiftlint --reporter github-actions-logging
+          else
+            swiftlint --reporter github-actions-logging || true
+          fi
+
+  python:
+    needs: detect
+    if: needs.detect.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/ruff-action@0ce1b0bf8b818ef400413f810f8a11cdbda0034b # v4.0.0
+        with:
+          args: "check --output-format=github"
+        continue-on-error: ${{ !inputs.strict }}
+
+  js:
+    needs: detect
+    if: needs.detect.outputs.js == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: biomejs/setup-biome@454fa0d884737805f48d7dc236c1761a0ac3cc13 # v2.6.0
+      - name: Biome check
+        run: |
+          biome ci --reporter=github . || {
+            rc=$?; [ "${{ inputs.strict }}" = "true" ] && exit $rc || true; }
+
+  shell:
+    needs: detect
+    if: needs.detect.outputs.shell == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: ShellCheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          # collect tracked shell scripts, prune vendored
+          mapfile -t files < <(git ls-files '*.sh' '*.bash' | grep -vE '(^|/)(node_modules|vendor|third_party)/' || true)
+          [ "${#files[@]}" -eq 0 ] && { echo "no shell files"; exit 0; }
+          shellcheck "${files[@]}" || { [ "${{ inputs.strict }}" = "true" ] && exit 1 || true; }
+
+  yaml:
+    needs: detect
+    if: needs.detect.outputs.yaml == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: yamllint
+        run: |
+          pipx install yamllint || pip install --user yamllint
+          yamllint -f github -d "{extends: relaxed, rules: {line-length: disable}}" . \
+            || { [ "${{ inputs.strict }}" = "true" ] && exit 1 || true; }
+
+  cpp:
+    needs: detect
+    if: needs.detect.outputs.cpp == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: cppcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq cppcheck
+          # own sources only — skip bundled whisper.cpp / third_party
+          ec=0; [ "${{ inputs.strict }}" = "true" ] && ec=1
+          cppcheck --enable=warning,portability --quiet --inline-suppr \
+            --suppress='*:*whisper.cpp/*' --suppress='*:*third_party/*' \
+            --error-exitcode="$ec" \
+            . 2>&1 | tee cppcheck.log || true
+
+  secrets:
+    # ALWAYS runs (no detect gate) and ALWAYS hard-fails on a hit.
+    needs: detect
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: gitleaks
+        run: |
+          VER=8.30.1
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${VER}/gitleaks_${VER}_linux_x64.tar.gz" \
+            | tar -xz -C /tmp gitleaks
+          /tmp/gitleaks dir . --redact --no-banner
+
