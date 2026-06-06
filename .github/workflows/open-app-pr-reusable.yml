@@ -54,10 +54,15 @@ on:
         required: false
         default: 'automated'
       auto-merge:
-        description: 'Squash-merge the PR automatically once opened.'
+        description: 'Merge the PR automatically once its checks pass.'
         type: boolean
         required: false
         default: true
+      merge-wait-minutes:
+        description: 'Max minutes to wait for checks before giving up (private repos that lack native auto-merge).'
+        type: number
+        required: false
+        default: 20
   workflow_dispatch:
     inputs:
       run:
@@ -93,10 +98,15 @@ on:
         required: false
         default: 'automated'
       auto-merge:
-        description: 'Squash-merge the PR automatically once opened.'
+        description: 'Merge the PR automatically once its checks pass.'
         type: boolean
         required: false
         default: true
+      merge-wait-minutes:
+        description: 'Max minutes to wait for checks before giving up (private repos that lack native auto-merge).'
+        type: number
+        required: false
+        default: 20
 
 permissions:
   contents: read
@@ -147,6 +157,7 @@ jobs:
           BASE_IN: ${{ inputs.base }}
           LABELS: ${{ inputs.labels }}
           AUTO_MERGE: ${{ inputs.auto-merge }}
+          MERGE_WAIT: ${{ inputs.merge-wait-minutes }}
         run: |
           set -euo pipefail
 
@@ -196,14 +207,33 @@ jobs:
           done
           IFS=$OLD_IFS
 
-          # ── Auto-merge ──────────────────────────────────────────────────────
-          # Native --auto is plan-gated on this free private org, so try it then
-          # fall back to a direct squash merge.
+          # ── Auto-merge on pass ──────────────────────────────────────────────
+          # Prefer GitHub native auto-merge: it merges ONLY once required checks
+          # go green. Where native auto-merge is unavailable (e.g. private free
+          # repos, where it cannot be enabled), fall back to watching the checks
+          # ourselves and squash-merging only if they all pass within the budget.
           if [ "$AUTO_MERGE" = "true" ]; then
-            gh pr merge "$pr" --repo "$REPO" --squash --auto 2>/dev/null \
-              || gh pr merge "$pr" --repo "$REPO" --squash 2>/dev/null \
-              || echo "::warning::Auto-merge could not complete; PR #$pr left open for review."
-            echo "Auto-merge requested for PR #$pr"
+            if gh pr merge "$pr" --repo "$REPO" --squash --auto 2>/tmp/automerge.err; then
+              echo "Native auto-merge armed for PR #$pr (merges when checks pass)."
+            else
+              echo "Native auto-merge unavailable: $(tr '\n' ' ' </tmp/automerge.err)"
+              echo "Falling back to wait-for-checks (up to ${MERGE_WAIT}m)…"
+              if gh pr checks "$pr" --repo "$REPO" >/tmp/checks.out 2>&1 \
+                   || ! grep -qi 'no checks' /tmp/checks.out; then
+                if timeout "${MERGE_WAIT}m" gh pr checks "$pr" --repo "$REPO" \
+                     --watch --interval 30 --fail-fast; then
+                  gh pr merge "$pr" --repo "$REPO" --squash \
+                    && echo "Checks passed — squash-merged PR #$pr." \
+                    || echo "::warning::Checks passed but merge failed; PR #$pr left open."
+                else
+                  echo "::warning::Checks failed or timed out (${MERGE_WAIT}m); PR #$pr left open for review."
+                fi
+              else
+                gh pr merge "$pr" --repo "$REPO" --squash \
+                  && echo "No checks configured — squash-merged PR #$pr." \
+                  || echo "::warning::Merge failed; PR #$pr left open."
+              fi
+            fi
           else
             echo "PR #$pr left open (auto-merge disabled)."
           fi
