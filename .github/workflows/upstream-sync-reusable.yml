@@ -4,6 +4,10 @@ name: Sync Fork With Upstream (reusable)
 # forked from, hands-off. Logic lives here; each fork has a thin scheduled
 # caller (upstream-sync.yml). Do not edit logic in the forks.
 #
+# Runs as the org GitHub App (safesettings-nerv) via a short-lived installation
+# token, so merge-upstream and issue ops act as a bot identity with
+# `workflows:write` (handles upstream changes to .github/workflows cleanly).
+#
 # Behaviour:
 #   * Clean fast-forward / merge  -> applied automatically, any open
 #                                    "upstream-sync" tracking issue is closed.
@@ -23,9 +27,16 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.NERV_APP_ID }}
+          private-key: ${{ secrets.NERV_APP_PRIVATE_KEY }}
+
       - name: Sync fork with upstream
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
           BRANCH: ${{ github.event.repository.default_branch }}
         run: |

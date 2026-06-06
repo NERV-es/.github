@@ -1,8 +1,11 @@
 name: AI Review (reusable)
 
-# Free, in-CI AI code review using GitHub Models (built-in GITHUB_TOKEN,
-# models:read). Read-only: posts a single review comment, never edits code.
-# Skips PRs opened by bots to avoid resolver→review loops.
+# Free, in-CI AI code review using GitHub Models. The review comment is posted
+# as the org GitHub App (safesettings-nerv) via a short-lived installation
+# token. The model call still uses MODELS_TOKEN (or the built-in token) because
+# GitHub Models inference is not available to app installation tokens.
+# Read-only on code: posts a single review comment, never edits code.
+# Skips PRs opened by bots to avoid resolver->review loops.
 
 on:
   workflow_call:
@@ -26,9 +29,16 @@ jobs:
     if: ${{ github.event.pull_request.user.type != 'Bot' }}
     runs-on: ubuntu-latest
     steps:
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.NERV_APP_ID }}
+          private-key: ${{ secrets.NERV_APP_PRIVATE_KEY }}
+
       - name: AI review
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           GH_MODELS_TOKEN: ${{ secrets.MODELS_TOKEN != '' && secrets.MODELS_TOKEN || github.token }}
           MODEL: ${{ inputs.model }}
           MAX_DIFF_BYTES: ${{ inputs.max_diff_bytes }}

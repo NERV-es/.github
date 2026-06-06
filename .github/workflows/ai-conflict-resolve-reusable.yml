@@ -1,7 +1,11 @@
 name: AI Conflict Resolve (reusable)
 
-# Free, in-CI AI resolution of upstream merge conflicts using GitHub Models
-# (no external API key — uses the built-in GITHUB_TOKEN with models:read).
+# Free, in-CI AI resolution of upstream merge conflicts using GitHub Models.
+# Git/PR/issue operations run as the org GitHub App (safesettings-nerv) via a
+# short-lived installation token — a bot identity with `workflows:write`, so it
+# can push branches that touch .github/workflows (which a PAT/GITHUB_TOKEN can't).
+# The model call still uses MODELS_TOKEN (or the built-in token) because GitHub
+# Models inference is not available to app installation tokens.
 # Produces a DRAFT pull request that waits for human approval. It NEVER merges.
 #
 # Trigger: invoked by each fork's ai-conflict-resolve.yml when the daily
@@ -25,17 +29,25 @@ jobs:
   resolve:
     runs-on: ubuntu-latest
     steps:
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.NERV_APP_ID }}
+          private-key: ${{ secrets.NERV_APP_PRIVATE_KEY }}
+
       - name: Checkout fork (full history)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
-          # Don't persist the Actions-app token as an http.extraheader; it would
-          # override our PAT on push and re-trigger the workflow-permission block.
+          token: ${{ steps.app-token.outputs.token }}
+          # Don't persist the token as an http.extraheader; we push via an
+          # explicit token URL below so workflow-file changes are allowed.
           persist-credentials: false
 
       - name: Fetch resolver script from org config
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
           mkdir -p .ci
@@ -45,7 +57,7 @@ jobs:
 
       - name: Resolve conflicts into a draft PR
         env:
-          GH_TOKEN: ${{ secrets.MODELS_TOKEN != '' && secrets.MODELS_TOKEN || github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           GH_MODELS_TOKEN: ${{ secrets.MODELS_TOKEN != '' && secrets.MODELS_TOKEN || github.token }}
           MODEL: ${{ inputs.model }}
           REPO: ${{ github.repository }}
@@ -87,8 +99,8 @@ jobs:
           rm -rf .ci
           git add -A && git commit -m "chore: drop resolver scratch" --no-edit || true
 
-          # Push via the token directly so workflow-file changes are allowed
-          # (the default Actions app lacks `workflows` push permission).
+          # Push via the app token directly. The app has `workflows:write`, so
+          # branches that modify .github/workflows push cleanly.
           git push --force-with-lease \
             "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$SYNC_BRANCH"
 
