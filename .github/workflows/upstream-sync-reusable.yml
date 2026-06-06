@@ -1,0 +1,115 @@
+name: Sync Fork With Upstream (reusable)
+
+# Keeps a NERV-es fork's default branch up to date with the repo it was
+# forked from, hands-off. Logic lives here; each fork has a thin scheduled
+# caller (upstream-sync.yml). Do not edit logic in the forks.
+#
+# Behaviour:
+#   * Clean fast-forward / merge  -> applied automatically, any open
+#                                    "upstream-sync" tracking issue is closed.
+#   * Merge conflicts (HTTP 409)  -> a single deduped tracking issue is
+#                                    opened/refreshed so the drift is visible
+#                                    and actionable. Nothing is force-applied.
+# Requires linear history to be OFF on the target branch (merge commits).
+
+on:
+  workflow_call:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync fork with upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          ISSUE_TITLE="🔄 Fork is behind upstream — manual sync needed"
+          ISSUE_LABEL="upstream-sync"
+
+          parent=$(gh api "repos/$REPO" --jq '.parent.full_name // empty')
+          if [ -z "$parent" ]; then
+            echo "Not a fork (no parent) — nothing to sync."
+            exit 0
+          fi
+          parent_branch=$(gh api "repos/$REPO" --jq '.parent.default_branch // "main"')
+          owner=${REPO%%/*}
+          echo "Syncing $REPO:$BRANCH from upstream $parent:$parent_branch"
+
+          # Find an existing open tracking issue (dedupe).
+          existing=$(gh issue list --repo "$REPO" --state open --label "$ISSUE_LABEL" \
+                       --json number --jq '.[0].number // empty' 2>/dev/null || true)
+
+          if out=$(gh api -X POST "repos/$REPO/merge-upstream" -f branch="$BRANCH" 2>err.txt); then
+            merge_type=$(printf '%s' "$out" | jq -r '.merge_type // "none"')
+            echo "✅ Synced (merge_type=$merge_type)"
+            if [ -n "$existing" ]; then
+              gh issue close "$existing" --repo "$REPO" \
+                --comment "Upstream sync succeeded (merge_type: ${merge_type}). Closing." || true
+            fi
+            exit 0
+          fi
+
+          # Non-zero from gh: distinguish conflict (409) from real errors.
+          if ! grep -qiE '409|merge conflict' err.txt; then
+            echo "Unexpected error from merge-upstream:"
+            cat err.txt
+            exit 1
+          fi
+
+          echo "::warning::Upstream sync has merge conflicts — opening/refreshing tracking issue."
+          cmp=$(gh api "repos/$parent/compare/$parent_branch...$owner:$BRANCH" \
+                  --jq '{behind:.behind_by, ahead:.ahead_by}' 2>/dev/null || echo '{}')
+          behind=$(printf '%s' "$cmp" | jq -r '.behind // "?"')
+          ahead=$(printf '%s' "$cmp" | jq -r '.ahead // "?"')
+
+          # Quoted heredoc -> all markdown (backticks, code fences) is literal.
+          # Placeholders are substituted afterwards with sed.
+          cat > body.md <<'EOF'
+          This fork's `__BRANCH__` has diverged from its upstream and cannot be
+          synced automatically because of **merge conflicts**.
+
+          | | |
+          |---|---|
+          | Upstream | [`__PARENT__:__PBRANCH__`](https://github.com/__PARENT__/tree/__PBRANCH__) |
+          | Behind by | __BEHIND__ commit(s) |
+          | Ahead by | __AHEAD__ commit(s) |
+
+          **Resolve via the GitHub UI** (Sync fork) or locally:
+
+          ```bash
+          git remote add upstream https://github.com/__PARENT__.git
+          git fetch upstream
+          git checkout __BRANCH__
+          git merge upstream/__PBRANCH__   # resolve conflicts, then push
+          ```
+
+          [Compare upstream → fork](https://github.com/__PARENT__/compare/__PBRANCH__...__OWNER__:__BRANCH__)
+
+          _Updated automatically by the daily upstream-sync workflow; closed once the fork syncs cleanly._
+          EOF
+
+          sed -i \
+            -e "s|__BRANCH__|$BRANCH|g" \
+            -e "s|__PARENT__|$parent|g" \
+            -e "s|__PBRANCH__|$parent_branch|g" \
+            -e "s|__OWNER__|$owner|g" \
+            -e "s|__BEHIND__|$behind|g" \
+            -e "s|__AHEAD__|$ahead|g" \
+            body.md
+
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --repo "$REPO" --body "$(cat body.md)" >/dev/null
+            echo "Refreshed tracking issue #$existing"
+          else
+            gh issue create --repo "$REPO" --title "$ISSUE_TITLE" \
+              --label "$ISSUE_LABEL" --body "$(cat body.md)" >/dev/null
+            echo "Opened tracking issue"
+          fi
