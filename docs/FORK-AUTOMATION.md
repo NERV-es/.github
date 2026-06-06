@@ -73,3 +73,40 @@ flagged for human review rather than truncated blindly.
 > `actions/checkout` must use `persist-credentials: false` in the resolver so
 > the `MODELS_TOKEN` PAT (not the Actions-app token) is used on push — otherwise
 > GitHub blocks the push of workflow-file changes.
+
+## Bobby-Claws auto-PRs (Dependabot-style)
+
+`open-app-pr-reusable.yml` lets any workflow open a PR **as the Bobby-Claws
+app** instead of pushing straight to a branch. The caller supplies a `run`
+command that mutates the working tree; if it produces a diff, the reusable
+commits it as `bobby-claws[bot]`, opens a PR, labels it, and (by default)
+squash-merges it once it's mergeable. Because it runs on an App installation
+token it can open PRs that touch `.github/workflows/**` across every repo, and —
+unlike `GITHUB_TOKEN` — its PRs re-trigger CI so checks gate the auto-merge.
+
+Call it from a scheduled stub:
+
+```yaml
+# .github/workflows/<something>.yml in any repo
+on:
+  schedule: [{ cron: '0 6 * * 1' }]   # weekly
+  workflow_dispatch:
+jobs:
+  maintenance:
+    uses: NERV-es/.github/.github/workflows/open-app-pr-reusable.yml@<sha>
+    secrets: inherit
+    with:
+      title: 'chore: weekly maintenance'
+      commit-message: 'chore: weekly maintenance'
+      branch: 'bot/maintenance'
+      labels: 'automated,maintenance'
+      auto-merge: true
+      run: |
+        # whatever produces the change, e.g. re-pin, regenerate, bump…
+        ./scripts/do-maintenance.sh
+```
+
+Set `auto-merge: false` to leave the PR open for manual review. It is purely
+additive — the existing direct-push automations (upstream-sync, stub-drift-
+enforcer) are unchanged; point new maintenance jobs at this when you want a
+reviewable PR instead of a silent commit.

@@ -1,0 +1,209 @@
+name: Open App PR (reusable)
+
+# Dependabot-style PR opener that runs AS the Bobby-Claws GitHub App.
+#
+# A caller supplies a `run` command that mutates the working tree; if it
+# produces a diff, this opens (or updates) a Bobby-Claws-authored PR and can
+# squash-merge it automatically. This is the hands-off alternative to pushing
+# straight to a branch: the change lands as a reviewable, attributed PR that
+# your existing checks gate, exactly like Dependabot's flow — but driven by
+# your own org App so it can touch .github/workflows/** (a PAT/GITHUB_TOKEN
+# cannot) across every repo.
+#
+# Why an App token and not GITHUB_TOKEN:
+#   * Commits/PRs are attributed to bobby-claws[bot] (verified author), not
+#     github-actions[bot].
+#   * An App-token PR DOES trigger downstream workflows, so CI runs on it and
+#     can gate the auto-merge (GITHUB_TOKEN PRs do not re-trigger workflows).
+#   * The org-wide install grants contents:write + pull-requests:write +
+#     workflows:write, so it can open PRs that edit workflow files.
+
+on:
+  workflow_call:
+    inputs:
+      run:
+        description: 'Shell that mutates the working tree (the change to PR).'
+        type: string
+        required: true
+      branch:
+        description: 'Head-branch prefix; a UTC timestamp is appended.'
+        type: string
+        required: false
+        default: 'bot/auto'
+      title:
+        description: 'PR title.'
+        type: string
+        required: true
+      body:
+        description: 'PR body (markdown).'
+        type: string
+        required: false
+        default: 'Automated maintenance by the Bobby-Claws app.'
+      commit-message:
+        description: 'Commit message.'
+        type: string
+        required: true
+      base:
+        description: 'Base branch (blank = the repo default branch).'
+        type: string
+        required: false
+        default: ''
+      labels:
+        description: 'Comma-separated labels to add (created if missing).'
+        type: string
+        required: false
+        default: 'automated'
+      auto-merge:
+        description: 'Squash-merge the PR automatically once opened.'
+        type: boolean
+        required: false
+        default: true
+  workflow_dispatch:
+    inputs:
+      run:
+        description: 'Shell that mutates the working tree (the change to PR).'
+        type: string
+        required: true
+      branch:
+        description: 'Head-branch prefix; a UTC timestamp is appended.'
+        type: string
+        required: false
+        default: 'bot/auto'
+      title:
+        description: 'PR title.'
+        type: string
+        required: true
+      body:
+        description: 'PR body (markdown).'
+        type: string
+        required: false
+        default: 'Automated maintenance by the Bobby-Claws app.'
+      commit-message:
+        description: 'Commit message.'
+        type: string
+        required: true
+      base:
+        description: 'Base branch (blank = the repo default branch).'
+        type: string
+        required: false
+        default: ''
+      labels:
+        description: 'Comma-separated labels to add (created if missing).'
+        type: string
+        required: false
+        default: 'automated'
+      auto-merge:
+        description: 'Squash-merge the PR automatically once opened.'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: open-app-pr-${{ github.repository }}-${{ inputs.branch }}
+  cancel-in-progress: false
+
+jobs:
+  open-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      # Short-lived org-wide installation token for the Bobby-Claws App.
+      - name: Generate app token (bobby-claws)
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.NERV_APP_ID }}
+          private-key: ${{ secrets.NERV_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
+
+      - name: Open or update a Bobby-Claws PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          REPO: ${{ github.repository }}
+          RUN_CMD: ${{ inputs.run }}
+          BRANCH_PREFIX: ${{ inputs.branch }}
+          PR_TITLE: ${{ inputs.title }}
+          PR_BODY: ${{ inputs.body }}
+          COMMIT_MSG: ${{ inputs.commit-message }}
+          BASE_IN: ${{ inputs.base }}
+          LABELS: ${{ inputs.labels }}
+          AUTO_MERGE: ${{ inputs.auto-merge }}
+        run: |
+          set -euo pipefail
+
+          # ── Bobby-Claws bot identity (verified-author attribution) ──────────
+          bot_id=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)
+          git config user.name  "${APP_SLUG}[bot]"
+          git config user.email "${bot_id}+${APP_SLUG}[bot]@users.noreply.github.com"
+
+          base="${BASE_IN}"
+          [ -z "$base" ] && base=$(gh api "repos/$REPO" --jq .default_branch)
+
+          # ── Produce the change ──────────────────────────────────────────────
+          bash -euo pipefail -c "$RUN_CMD"
+
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "No changes produced — nothing to PR."
+            exit 0
+          fi
+
+          head="${BRANCH_PREFIX}/$(date -u +%Y%m%d-%H%M%S)"
+          git checkout -b "$head"
+          git add -A
+          git commit -m "$COMMIT_MSG"
+          # Push over the App token URL (persist-credentials:false above means the
+          # checkout left no competing extraheader to override it).
+          git push "https://x-access-token:${TOKEN}@github.com/${REPO}.git" "HEAD:${head}"
+
+          # ── Open the PR (idempotent on the head branch) ─────────────────────
+          pr=$(gh pr list --repo "$REPO" --head "$head" --state open \
+                 --json number --jq '.[0].number // empty')
+          if [ -z "$pr" ]; then
+            url=$(gh pr create --repo "$REPO" --base "$base" --head "$head" \
+                    --title "$PR_TITLE" --body "$PR_BODY")
+            pr=$(printf '%s' "$url" | grep -oE '[0-9]+$' | tail -1)
+            echo "Opened PR #$pr — $url"
+          else
+            echo "Reusing open PR #$pr on $head"
+          fi
+
+          # ── Labels (best-effort; create if absent) ──────────────────────────
+          OLD_IFS=$IFS; IFS=','
+          for l in $LABELS; do
+            l=$(printf '%s' "$l" | xargs)
+            [ -z "$l" ] && continue
+            gh label create "$l" --repo "$REPO" --force >/dev/null 2>&1 || true
+            gh pr edit "$pr" --repo "$REPO" --add-label "$l" >/dev/null 2>&1 || true
+          done
+          IFS=$OLD_IFS
+
+          # ── Auto-merge ──────────────────────────────────────────────────────
+          # Native --auto is plan-gated on this free private org, so try it then
+          # fall back to a direct squash merge.
+          if [ "$AUTO_MERGE" = "true" ]; then
+            gh pr merge "$pr" --repo "$REPO" --squash --auto 2>/dev/null \
+              || gh pr merge "$pr" --repo "$REPO" --squash 2>/dev/null \
+              || echo "::warning::Auto-merge could not complete; PR #$pr left open for review."
+            echo "Auto-merge requested for PR #$pr"
+          else
+            echo "PR #$pr left open (auto-merge disabled)."
+          fi
