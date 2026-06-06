@@ -1,0 +1,17 @@
+# Thin caller: gives this org `.github` repo's own PRs a free-tier AI review.
+# All logic lives in the pinned reusable; this just opts the repo in.
+name: AI review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  models: read
+
+jobs:
+  ai-review:
+    uses: NERV-es/.github/.github/workflows/ai-review-reusable.yml@ai-review-v1
+    secrets: inherit

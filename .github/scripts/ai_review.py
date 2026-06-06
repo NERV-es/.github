@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
-"""Multi-LLM free-tier PR reviewer for NERV.
+"""Free-tier fallback PR reviewer for NERV.
 
-Fans a unified diff out to every free-tier LLM whose API key is present in the
-environment, then posts ONE consolidated review comment on the PR (idempotent —
-it edits its own previous comment instead of stacking new ones).
+Tries free-tier LLMs in priority order (highest free capacity first) and uses the
+FIRST one that returns a usable review — a fallback chain, not a fan-out. If the
+top provider is rate-limited (429, with Retry-After backoff) or errors, it falls
+through to the next. GitHub Models (zero-key, built-in token) is the final,
+always-available safety net, so a repo with no external keys still gets reviewed.
+
+Posts ONE idempotent comment (edits its own previous comment via a marker instead
+of stacking new ones).
 
 Stdlib only (urllib) so the CI step needs no `pip install` — fast and hermetic.
-Every provider call is isolated: one provider erroring (rate-limit, outage, bad
-key) never blocks the others or fails the job.
 
 All providers are reached through their OpenAI-compatible /chat/completions
-surface, so adding another is just one row in PROVIDERS below.
+surface, so adding another is just one row in PROVIDERS below. Each row may set
+`max_chars` (its context budget); the diff is truncated to that budget per
+provider before the call.
 
-Driven entirely by env (set in .github/workflows/ai-review.yml):
+Driven entirely by env (set in the ai-review reusable workflow):
   GITHUB_TOKEN, GITHUB_REPOSITORY, PR_NUMBER   — to post the comment
   DIFF_FILE                                     — path to the unified diff
+  MAX_DIFF_CHARS                                — global cap (optional override)
   <PROVIDER>_API_KEY                            — presence enables that provider
 """
 
@@ -23,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -38,57 +45,36 @@ HTTP_TIMEOUT = 90
 # Each provider is an OpenAI-compatible chat endpoint. `env` is the secret name;
 # a provider is simply skipped when its key is absent (the repo's key-gated
 # convention, enforced one layer up by the workflow's guard job).
+#
+# ORDER IS THE FALLBACK CHAIN — highest free-tier capacity / reliability first.
+# The first provider that returns a usable review wins; the rest are not called.
+# GitHub Models is intentionally LAST: it's the zero-key, always-available net
+# (built-in Actions token) so even a repo with no external keys gets a review.
+# `max_chars` is each provider's diff budget (context window / token limits).
 PROVIDERS = [
     {
-        # Zero-config default: GitHub Models is free and uses the built-in
-        # Actions token (models:read). Always active in CI — GH_MODELS_TOKEN
-        # falls back to GITHUB_TOKEN in the workflow. No external key needed.
-        "name": "GitHub Models · gpt-4o-mini",
-        "env": "GH_MODELS_TOKEN",
-        "url": "https://models.github.ai/inference/chat/completions",
-        "model": "openai/gpt-4o-mini",
-    },
-    {
-        "name": "Groq · llama-3.3-70b",
-        "env": "GROQ_API_KEY",
-        "url": "https://api.groq.com/openai/v1/chat/completions",
-        "model": "llama-3.3-70b-versatile",
-    },
-    {
+        # Generous free throughput + large context; reliable.
         "name": "Cerebras · gpt-oss-120b",
         "env": "CEREBRAS_API_KEY",
         "url": "https://api.cerebras.ai/v1/chat/completions",
         "model": "gpt-oss-120b",
+        "max_chars": 40_000,
     },
     {
-        "name": "Gemini · 2.0-flash",
-        "env": "GEMINI_API_KEY",
-        "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-        "model": "gemini-2.0-flash",
-    },
-    {
-        "name": "OpenRouter · llama-3.3-70b (free)",
-        "env": "OPENROUTER_API_KEY",
-        "url": "https://openrouter.ai/api/v1/chat/completions",
-        "model": "meta-llama/llama-3.3-70b-instruct:free",
-    },
-    {
-        "name": "Mistral · codestral",
-        "env": "MISTRAL_API_KEY",
-        "url": "https://api.mistral.ai/v1/chat/completions",
-        "model": "codestral-latest",
-    },
-    {
+        # Free NIM credits, 128k context, strong 70b; reliable.
         "name": "NVIDIA NIM · llama-3.3-70b",
         "env": "NVIDIA_API_KEY",
         "url": "https://integrate.api.nvidia.com/v1/chat/completions",
         "model": "meta/llama-3.3-70b-instruct",
+        "max_chars": 40_000,
     },
     {
-        "name": "Cohere · command-r-plus",
-        "env": "COHERE_API_KEY",
-        "url": "https://api.cohere.ai/compatibility/v1/chat/completions",
-        "model": "command-r-plus-08-2024",
+        # Fast but low per-minute token budget (~12k TPM) — keep diff smaller.
+        "name": "Groq · llama-3.3-70b",
+        "env": "GROQ_API_KEY",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "model": "llama-3.3-70b-versatile",
+        "max_chars": 18_000,
     },
     {
         # Workers AI's OpenAI-compatible endpoint needs the account id in the
@@ -99,6 +85,51 @@ PROVIDERS = [
         "url": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions",
         "model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
         "url_account_env": "CLOUDFLARE_ACCOUNT_ID",
+        "max_chars": 24_000,
+    },
+    {
+        # Command-R+ trial, 128k context.
+        "name": "Cohere · command-r-plus",
+        "env": "COHERE_API_KEY",
+        "url": "https://api.cohere.ai/compatibility/v1/chat/completions",
+        "model": "command-r-plus-08-2024",
+        "max_chars": 40_000,
+    },
+    {
+        # Code-focused; solid free tier.
+        "name": "Mistral · codestral",
+        "env": "MISTRAL_API_KEY",
+        "url": "https://api.mistral.ai/v1/chat/completions",
+        "model": "codestral-latest",
+        "max_chars": 28_000,
+    },
+    {
+        # Huge context but frequently 429s on the free tier — lower priority.
+        "name": "Gemini · 2.0-flash",
+        "env": "GEMINI_API_KEY",
+        "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "model": "gemini-2.0-flash",
+        "max_chars": 40_000,
+    },
+    {
+        # Free upstream pool is often saturated (429) — near-last resort.
+        "name": "OpenRouter · llama-3.3-70b (free)",
+        "env": "OPENROUTER_API_KEY",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "model": "meta-llama/llama-3.3-70b-instruct:free",
+        "max_chars": 28_000,
+    },
+    {
+        # Zero-config FINAL safety net: GitHub Models is free and uses the
+        # built-in Actions token (models:read). Always active in CI —
+        # GH_MODELS_TOKEN falls back to GITHUB_TOKEN in the workflow. Low daily
+        # quota + small token cap, so it's last — but guarantees every repo a
+        # review even with no external keys.
+        "name": "GitHub Models · gpt-4o-mini",
+        "env": "GH_MODELS_TOKEN",
+        "url": "https://models.github.ai/inference/chat/completions",
+        "model": "openai/gpt-4o-mini",
+        "max_chars": 14_000,
     },
 ]
 
@@ -120,10 +151,13 @@ def http_post_json(url: str, headers: dict, payload: dict, timeout: int) -> dict
         return json.loads(resp.read().decode("utf-8"))
 
 
-def review_with(provider: dict, diff: str) -> str:
+def review_with(provider: dict, diff: str, budget: int) -> str | None:
+    """Call one provider. Returns the review text, or None if it's unavailable
+    (no key, missing account id, rate-limited past retries, or any error) so the
+    caller can fall through to the next provider in the chain."""
     key = os.environ.get(provider["env"], "").strip()
     if not key:
-        return ""
+        return None
     url = provider["url"]
     # Providers whose endpoint embeds an account id (e.g. Cloudflare Workers AI)
     # stay dormant until that id is supplied.
@@ -131,8 +165,10 @@ def review_with(provider: dict, diff: str) -> str:
     if acct_env:
         acct = os.environ.get(acct_env, "").strip()
         if not acct:
-            return ""
+            return None
         url = url.format(account_id=acct)
+    if len(diff) > budget:
+        diff = diff[:budget]
     headers = {
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
@@ -152,25 +188,37 @@ def review_with(provider: dict, diff: str) -> str:
             },
         ],
     }
-    try:
-        body = http_post_json(url, headers, payload, HTTP_TIMEOUT)
-        choices = body.get("choices") or []
-        if not choices:
-            return f"_provider error: no choices in response — {str(body)[:200]}_"
-        msg = choices[0].get("message", {}) or {}
-        content = msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning") or ""
-        # Some providers return content as a list of typed parts.
-        if isinstance(content, list):
-            content = "".join(
-                p.get("text", "") if isinstance(p, dict) else str(p) for p in content
-            )
-        content = (content or "").strip()
-        return content or "_(empty response)_"
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", "replace")[:300]
-        return f"_provider error: HTTP {e.code} — {detail}_"
-    except Exception as e:  # noqa: BLE001 — never let one provider kill the review
-        return f"_provider error: {e}_"
+    # Retry on 429 with Retry-After backoff (mirrors scripts/ai_resolve.py).
+    for attempt in range(3):
+        try:
+            body = http_post_json(url, headers, payload, HTTP_TIMEOUT)
+            choices = body.get("choices") or []
+            if not choices:
+                print(f"  {provider['name']}: no choices — {str(body)[:160]}", flush=True)
+                return None
+            msg = choices[0].get("message", {}) or {}
+            content = msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning") or ""
+            # Some providers return content as a list of typed parts.
+            if isinstance(content, list):
+                content = "".join(
+                    p.get("text", "") if isinstance(p, dict) else str(p) for p in content
+                )
+            content = (content or "").strip()
+            return content or None
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                wait = int(e.headers.get("Retry-After", "0") or 0) or (6 * (attempt + 1))
+                wait = min(wait, 30)
+                print(f"  {provider['name']}: rate limited, waiting {wait}s", flush=True)
+                time.sleep(wait)
+                continue
+            detail = e.read().decode("utf-8", "replace")[:200]
+            print(f"  {provider['name']}: HTTP {e.code} — {detail}", flush=True)
+            return None
+        except Exception as e:  # noqa: BLE001 — fall through to the next provider
+            print(f"  {provider['name']}: error — {e}", flush=True)
+            return None
+    return None
 
 
 def gh_api(method: str, url: str, token: str, payload: dict | None = None) -> dict:
@@ -225,12 +273,6 @@ def main() -> int:
         print("Empty diff — nothing to review.")
         return 0
 
-    truncated = len(diff) > max_diff_chars
-    if truncated:
-        diff = diff[:max_diff_chars]
-
-    sections: list[str] = []
-
     def _enabled(p: dict) -> bool:
         if not os.environ.get(p["env"], "").strip():
             return False
@@ -244,28 +286,47 @@ def main() -> int:
         print("No provider API keys present — skipping.")
         return 0
 
-    print(f"Active providers: {', '.join(p['name'] for p in active)}")
-    for provider in active:
-        out = review_with(provider, diff)
-        if out:
-            sections.append(f"### {provider['name']}\n\n{out}")
+    print(f"Fallback chain: {' -> '.join(p['name'] for p in active)}")
 
-    if not sections:
-        print("No provider returned a review.")
+    chosen: dict | None = None
+    review: str | None = None
+    chosen_budget = max_diff_chars
+    tried: list[str] = []
+    for provider in active:
+        # Per-provider diff budget: the smaller of the global cap and the
+        # provider's own context window. "Go down or chunk" -> truncate to fit.
+        budget = min(max_diff_chars, provider.get("max_chars", max_diff_chars))
+        print(f"Trying {provider['name']} (budget {budget:,} chars)...")
+        out = review_with(provider, diff, budget)
+        if out:
+            chosen = provider
+            review = out
+            chosen_budget = budget
+            break
+        tried.append(provider["name"])
+        print(f"  -> unavailable, falling through.")
+
+    if not review or chosen is None:
+        print("All providers in the chain were unavailable — no review posted.")
         return 0
 
-    note = (
-        "\n\n> ⚠️ Diff was truncated to the first "
-        f"{max_diff_chars:,} characters for the model context."
-        if truncated
-        else ""
+    truncated = len(diff) > chosen_budget
+    notes = []
+    if tried:
+        notes.append("fell back past " + ", ".join(tried))
+    if truncated:
+        notes.append(
+            f"diff truncated to the first {chosen_budget:,} chars for context"
+        )
+    footer = (
+        f"\n\n---\n_Reviewed by **{chosen['name']}** · free-tier fallback chain, "
+        "advisory only"
+        + (f" — {'; '.join(notes)}" if notes else "")
+        + "._"
     )
     body = (
         f"{MARKER}\n"
-        "## 🤖 Multi-LLM review\n"
-        "_Free-tier models, advisory only. Each model reviews independently; "
-        "agreement across models is a strong signal._"
-        f"{note}\n\n" + "\n\n---\n\n".join(sections)
+        "## 🤖 AI review\n\n" + review + footer
     )
 
     upsert_comment(repo, pr, token, body)
