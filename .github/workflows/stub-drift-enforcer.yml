@@ -1,0 +1,48 @@
+name: Stub Drift Enforcer
+
+# Keeps every NERV-es thin-stub caller pinned to the canonical (latest) SHA of
+# its reusable workflow in NERV-es/.github. Self-discovering & idempotent.
+# Runs as the Bobby-Claws GitHub App (org-wide token) so it can push stub edits
+# touching .github/workflows/** across every repo — a PAT/GITHUB_TOKEN cannot.
+
+on:
+  schedule:
+    - cron: '37 7 * * *'        # nightly, after upstream-sync (06:17)
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/*-reusable.yml'   # a reusable changed -> re-pin callers
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Report drift without pushing fixes'
+        type: boolean
+        default: false
+
+concurrency:
+  group: stub-drift-enforcer
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  enforce:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (for the enforcer script)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+
+      - name: Generate app token (org-wide)
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          app-id: ${{ secrets.NERV_APP_ID }}
+          private-key: ${{ secrets.NERV_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Enforce stub SHA pinning
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+        run: python3 .github/scripts/stub_drift_enforcer.py
