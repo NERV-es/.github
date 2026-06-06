@@ -1,0 +1,50 @@
+name: Build Provenance (shared)
+
+# Shared artifact attestation. Logic lives here in NERV-es/.github; release-
+# publishing repos call it via a SHA-pinned stub (.github/workflows/
+# attest-release.yml) that triggers on `release: published`.
+#
+# Downloads the published release's assets and generates a signed build-
+# provenance attestation for each. Decoupled from upstream build workflows so
+# it never conflicts with fork upstream-sync. Attestations are free for PUBLIC
+# repos (private needs GitHub Advanced Security).
+
+on:
+  workflow_call:
+    inputs:
+      pattern:
+        description: 'Glob of release assets to attest.'
+        type: string
+        default: '*'
+
+permissions:
+  contents: read
+
+jobs:
+  attest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          PATTERN: ${{ inputs.pattern }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "$TAG" \
+            --repo "${{ github.repository }}" \
+            --dir dist \
+            --pattern "$PATTERN" || echo "No matching assets for $TAG"
+          echo "Downloaded:"; ls -la dist || true
+          count=$(find dist -type f | wc -l | tr -d ' ')
+          echo "asset_count=$count" >> "$GITHUB_ENV"
+      - name: Attest build provenance
+        if: env.asset_count != '0'
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32
+        with:
+          subject-path: 'dist/**'
