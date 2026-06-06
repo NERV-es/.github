@@ -105,6 +105,11 @@ jobs:
             -e "s|__AHEAD__|$ahead|g" \
             body.md
 
+          # Ensure the label exists (don't depend on safe-settings timing).
+          gh label create "$ISSUE_LABEL" --repo "$REPO" --color 1d76db \
+            --description "Fork is behind upstream and needs manual conflict resolution" \
+            --force >/dev/null 2>&1 || true
+
           if [ -n "$existing" ]; then
             gh issue edit "$existing" --repo "$REPO" --body "$(cat body.md)" >/dev/null
             echo "Refreshed tracking issue #$existing"
