@@ -1,0 +1,88 @@
+name: AI Review (reusable)
+
+# Free, in-CI AI code review using GitHub Models (built-in GITHUB_TOKEN,
+# models:read). Read-only: posts a single review comment, never edits code.
+# Skips PRs opened by bots to avoid resolver→review loops.
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: GitHub Models model id
+        type: string
+        default: openai/gpt-4o-mini
+      max_diff_bytes:
+        description: Truncate the diff sent to the model
+        type: number
+        default: 60000
+
+permissions:
+  contents: read
+  pull-requests: write
+  models: read
+
+jobs:
+  review:
+    if: ${{ github.event.pull_request.user.type != 'Bot' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: AI review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_MODELS_TOKEN: ${{ secrets.MODELS_TOKEN != '' && secrets.MODELS_TOKEN || github.token }}
+          MODEL: ${{ inputs.model }}
+          MAX_DIFF_BYTES: ${{ inputs.max_diff_bytes }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          diff=$(gh pr diff "$PR" --repo "$REPO" || true)
+          if [ -z "$diff" ]; then echo "Empty diff — skipping."; exit 0; fi
+          diff=$(printf '%s' "$diff" | head -c "$MAX_DIFF_BYTES")
+
+          title=$(gh pr view "$PR" --repo "$REPO" --json title --jq .title)
+
+          sys='You are a precise, senior code reviewer. Review the unified diff.
+          Output GitHub-flavored markdown only. Be concise and high-signal:
+          flag real bugs, security issues, and logic errors with file:line refs.
+          Skip style nits. If nothing material, say so in one line. Do NOT echo the diff.'
+
+          payload=$(MODEL="$MODEL" SYS="$sys" TITLE="$title" DIFF="$diff" python3 - <<'PY'
+          import json, os
+          print(json.dumps({
+              "model": os.environ["MODEL"],
+              "temperature": 0,
+              "messages": [
+                  {"role": "system", "content": os.environ["SYS"]},
+                  {"role": "user", "content":
+                      "PR title: " + os.environ["TITLE"] + "\n\nUnified diff:\n\n" +
+                      os.environ["DIFF"]},
+              ],
+          }))
+          PY
+          )
+
+          resp=$(curl -sS https://models.github.ai/inference/chat/completions \
+            -H "Authorization: Bearer $GH_MODELS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$payload" || true)
+
+          review=$(printf '%s' "$resp" | python3 -c \
+            'import sys,json; d=json.load(sys.stdin); print(d.get("choices",[{}])[0].get("message",{}).get("content","") or "")' \
+            2>/dev/null || true)
+
+          if [ -z "$review" ]; then
+            echo "No review content (model error or rate limit). Response:"; echo "$resp" | head -c 800
+            exit 0
+          fi
+
+          {
+            echo "## 🤖 AI code review"
+            echo
+            printf '%s\n' "$review"
+            echo
+            echo "_Free GitHub Models review (\`$MODEL\`). Advisory only — not a merge gate._"
+          } > review.md
+
+          gh pr comment "$PR" --repo "$REPO" --body-file review.md

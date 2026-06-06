@@ -1,0 +1,117 @@
+name: AI Conflict Resolve (reusable)
+
+# Free, in-CI AI resolution of upstream merge conflicts using GitHub Models
+# (no external API key — uses the built-in GITHUB_TOKEN with models:read).
+# Produces a DRAFT pull request that waits for human approval. It NEVER merges.
+#
+# Trigger: invoked by each fork's ai-conflict-resolve.yml when the daily
+# upstream-sync workflow labels a tracking issue `upstream-sync`, or manually.
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: GitHub Models model id
+        type: string
+        default: openai/gpt-4o-mini
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  models: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Fetch resolver script from org config
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p .ci
+          gh api repos/${{ github.repository_owner }}/.github/contents/scripts/ai_resolve.py \
+            --jq '.content' | base64 -d > .ci/ai_resolve.py
+          test -s .ci/ai_resolve.py
+
+      - name: Resolve conflicts into a draft PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_MODELS_TOKEN: ${{ secrets.MODELS_TOKEN != '' && secrets.MODELS_TOKEN || github.token }}
+          MODEL: ${{ inputs.model }}
+          REPO: ${{ github.repository }}
+          SYNC_BRANCH: ai/upstream-sync
+        run: |
+          set -euo pipefail
+
+          # Dedupe: skip if a resolution PR is already open.
+          if gh pr list --repo "$REPO" --head "$SYNC_BRANCH" --state open \
+               --json number --jq 'length' | grep -qv '^0$'; then
+            echo "An open $SYNC_BRANCH PR already exists — nothing to do."
+            exit 0
+          fi
+
+          base=$(gh api "repos/$REPO" --jq '.default_branch')
+          parent=$(gh api "repos/$REPO" --jq '.parent.full_name // empty')
+          pbranch=$(gh api "repos/$REPO" --jq '.parent.default_branch // "main"')
+          if [ -z "$parent" ]; then echo "Not a fork — nothing to sync."; exit 0; fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "https://github.com/$parent.git"
+          git fetch --no-tags upstream "$pbranch"
+
+          git checkout -B "$SYNC_BRANCH" "origin/$base"
+          # Leave conflicts in the tree for the resolver. Keep going on conflict.
+          git merge --no-commit --no-ff "upstream/$pbranch" || true
+
+          if ! git ls-files -u | grep -q .; then
+            echo "No conflicts after merge — clean. Committing straight sync."
+            git commit --no-edit || { echo "Nothing to commit."; exit 0; }
+          else
+            python3 .ci/ai_resolve.py
+            git add -A
+            git commit -m "AI-resolved merge of upstream/$pbranch into $base" --no-edit || true
+          fi
+
+          rm -rf .ci
+          git add -A && git commit -m "chore: drop resolver scratch" --no-edit || true
+
+          git push --force-with-lease origin "$SYNC_BRANCH"
+
+          body_file=ai_resolve_summary.md
+          [ -f "$body_file" ] || echo "Clean upstream sync (no conflicts)." > "$body_file"
+          {
+            echo
+            echo "---"
+            echo "Upstream: \`$parent:$pbranch\` → \`$REPO:$base\`."
+            echo "_Opened automatically; **draft until you approve & merge**._"
+          } >> "$body_file"
+
+          pr_url=""
+          if gh pr create --repo "$REPO" --draft \
+               --base "$base" --head "$SYNC_BRANCH" \
+               --title "🤖 AI-resolved upstream sync (review required)" \
+               --body-file "$body_file" > pr.txt 2> pr.err; then
+            pr_url=$(cat pr.txt)
+          else
+            echo "pr create failed (likely exists); updating:"; cat pr.err
+            gh pr edit --repo "$REPO" "$SYNC_BRANCH" --body-file "$body_file" || true
+            pr_url=$(gh pr view --repo "$REPO" "$SYNC_BRANCH" --json url --jq .url)
+          fi
+          echo "PR: $pr_url"
+
+          # Link the PR on the open tracking issue, if any.
+          issue=$(gh issue list --repo "$REPO" --state open --label upstream-sync \
+                    --json number --jq '.[0].number // empty' 2>/dev/null || true)
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --repo "$REPO" \
+              --body "🤖 Opened an AI-resolved draft PR for review: $pr_url" || true
+          fi
