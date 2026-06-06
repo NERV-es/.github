@@ -39,8 +39,8 @@ jobs:
 
           diff=$(gh pr diff "$PR" --repo "$REPO" || true)
           if [ -z "$diff" ]; then echo "Empty diff — skipping."; exit 0; fi
-          full_len=$(printf '%s' "$diff" | wc -c | tr -d ' ')
-          diff=$(printf '%s' "$diff" | head -c "$MAX_DIFF_BYTES")
+          full_len=${#diff}
+          diff="${diff:0:$MAX_DIFF_BYTES}"
           trunc=""
           if [ "$full_len" -gt "$MAX_DIFF_BYTES" ]; then
             trunc="⚠️ Large PR: only the first ${MAX_DIFF_BYTES} of ${full_len} diff bytes were reviewed."
