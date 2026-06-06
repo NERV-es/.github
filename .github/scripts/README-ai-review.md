@@ -62,6 +62,24 @@ account id in the URL, so it needs **both** `CLOUDFLARE_API_KEY` **and**
 `CLOUDFLARE_ACCOUNT_ID` (the 32-hex id from your Cloudflare dashboard URL /
 right sidebar). The provider auto-skips until both are present.
 
+### Multiple accounts per provider (double the capacity)
+
+Each provider can be backed by **several accounts** via numbered secrets —
+`GROQ_API_KEY`, then `GROQ_API_KEY_2`, `_3`, … up to `_5`. When the primary
+account hits its rate limit (429) or its key is rejected (401/403), the script
+**rotates to the next key** for that same provider before falling through to the
+next provider — so two Groq accounts ≈ double Groq's free throughput. The chain
+log shows `Groq(2x)` when a provider has extra keys. Adding another account
+later is purely additive: set `<PROVIDER>_API_KEY_N` and add the matching line
+to `ai-review-reusable.yml`'s env — no code change.
+
+```bash
+gh secret set GROQ_API_KEY_2     --repo NERV-es/NERV
+gh secret set CEREBRAS_API_KEY_2 --repo NERV-es/NERV
+gh secret set NVIDIA_API_KEY_2   --repo NERV-es/NERV
+gh secret set COHERE_API_KEY_2   --repo NERV-es/NERV
+```
+
 ## Large PRs: chunked review
 
 A normal-sized PR is a single cheap call (the fallback chain above). When a diff

@@ -205,13 +205,33 @@ def http_post_json(url: str, headers: dict, payload: dict, timeout: int) -> dict
         return json.loads(resp.read().decode("utf-8"))
 
 
+def provider_keys(provider: dict) -> list[str]:
+    """All API keys configured for a provider, primary first. A provider can be
+    backed by several accounts via numbered env vars — e.g. GROQ_API_KEY plus
+    GROQ_API_KEY_2, _3 — which roughly multiplies its free-tier capacity. Adding
+    another account later is just a new *_N secret + workflow wiring, no code
+    change. Duplicates and blanks are dropped."""
+    base = provider["env"]
+    names = [base] + [f"{base}_{i}" for i in range(2, 6)]
+    seen: set[str] = set()
+    keys: list[str] = []
+    for n in names:
+        v = os.environ.get(n, "").strip()
+        if v and v not in seen:
+            seen.add(v)
+            keys.append(v)
+    return keys
+
+
 def _chat(provider: dict, messages: list[dict], max_tokens: int = 1200) -> str | None:
     """Shared OpenAI-compatible chat call with the chain's None-on-failure
-    semantics and 429 backoff. Returns the assistant text or None (no key,
-    missing account id, rate-limited past retries, or any error) so callers can
+    semantics. Tries each of the provider's keys (separate accounts) in turn,
+    rotating to the next key on a 429/auth error so a single exhausted account
+    doesn't sink the provider; backs off and retries the whole key set once if
+    every key is rate-limited. Returns the assistant text or None so callers can
     fall through to the next provider."""
-    key = os.environ.get(provider["env"], "").strip()
-    if not key:
+    keys = provider_keys(provider)
+    if not keys:
         return None
     url = provider["url"]
     # Providers whose endpoint embeds an account id (e.g. Cloudflare Workers AI)
@@ -222,49 +242,57 @@ def _chat(provider: dict, messages: list[dict], max_tokens: int = 1200) -> str |
         if not acct:
             return None
         url = url.format(account_id=acct)
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-        # Groq/Cerebras sit behind Cloudflare, which 403s (error 1010) the
-        # default python-urllib User-Agent. Present a normal UA instead.
-        "User-Agent": "nerv-ai-review/1.0 (+https://github.com/NERV-es/NERV)",
-    }
     payload = {
         "model": provider["model"],
         "temperature": 0.1,
         "max_tokens": max_tokens,
         "messages": messages,
     }
-    # Retry on 429 with Retry-After backoff (mirrors scripts/ai_resolve.py).
-    for attempt in range(3):
-        try:
-            body = http_post_json(url, headers, payload, HTTP_TIMEOUT)
-            choices = body.get("choices") or []
-            if not choices:
-                print(f"  {provider['name']}: no choices — {str(body)[:160]}", flush=True)
+    n_keys = len(keys)
+    # Up to 2 rounds over the key set: round 1 rotates keys on 429, round 2 gives
+    # a single backoff in case every account was briefly throttled together.
+    for rnd in range(2):
+        all_rate_limited = True
+        for ki, key in enumerate(keys):
+            label = "" if n_keys == 1 else f" [key {ki + 1}/{n_keys}]"
+            headers = {
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                # Groq/Cerebras sit behind Cloudflare, which 403s (error 1010)
+                # the default python-urllib User-Agent. Present a normal UA.
+                "User-Agent": "nerv-ai-review/1.0 (+https://github.com/NERV-es/NERV)",
+            }
+            try:
+                body = http_post_json(url, headers, payload, HTTP_TIMEOUT)
+                choices = body.get("choices") or []
+                if not choices:
+                    print(f"  {provider['name']}{label}: no choices — {str(body)[:160]}", flush=True)
+                    return None
+                msg = choices[0].get("message", {}) or {}
+                content = msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning") or ""
+                # Some providers return content as a list of typed parts.
+                if isinstance(content, list):
+                    content = "".join(
+                        p.get("text", "") if isinstance(p, dict) else str(p) for p in content
+                    )
+                content = (content or "").strip()
+                return content or None
+            except urllib.error.HTTPError as e:
+                # 429 (rate limit) or 401/403 (this account's key bad/blocked):
+                # try the next account before giving up on the provider.
+                if e.code in (429, 401, 403):
+                    print(f"  {provider['name']}{label}: HTTP {e.code} — trying next key/backoff", flush=True)
+                    continue
+                detail = e.read().decode("utf-8", "replace")[:200]
+                print(f"  {provider['name']}{label}: HTTP {e.code} — {detail}", flush=True)
                 return None
-            msg = choices[0].get("message", {}) or {}
-            content = msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning") or ""
-            # Some providers return content as a list of typed parts.
-            if isinstance(content, list):
-                content = "".join(
-                    p.get("text", "") if isinstance(p, dict) else str(p) for p in content
-                )
-            content = (content or "").strip()
-            return content or None
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                wait = int(e.headers.get("Retry-After", "0") or 0) or (6 * (attempt + 1))
-                wait = min(wait, 30)
-                print(f"  {provider['name']}: rate limited, waiting {wait}s", flush=True)
-                time.sleep(wait)
-                continue
-            detail = e.read().decode("utf-8", "replace")[:200]
-            print(f"  {provider['name']}: HTTP {e.code} — {detail}", flush=True)
-            return None
-        except Exception as e:  # noqa: BLE001 — fall through to the next provider
-            print(f"  {provider['name']}: error — {e}", flush=True)
-            return None
+            except Exception as e:  # noqa: BLE001 — fall through to the next provider
+                print(f"  {provider['name']}{label}: error — {e}", flush=True)
+                return None
+        # Every key was rate-limited/blocked this round.
+        if all_rate_limited and rnd == 0:
+            print(f"  {provider['name']}: all {n_keys} key(s) throttled — backing off 8s", flush=True)
+            time.sleep(8)
     return None
 
 
@@ -561,7 +589,7 @@ def main() -> int:
         return 0
 
     def _enabled(p: dict) -> bool:
-        if not os.environ.get(p["env"], "").strip():
+        if not provider_keys(p):
             return False
         acct_env = p.get("url_account_env")
         if acct_env and not os.environ.get(acct_env, "").strip():
@@ -573,7 +601,11 @@ def main() -> int:
         print("No provider API keys present — skipping.")
         return 0
 
-    print(f"Fallback chain: {' -> '.join(p['name'] for p in active)}")
+    chain = " -> ".join(
+        f"{p['name']}({len(provider_keys(p))}x)" if len(provider_keys(p)) > 1 else p["name"]
+        for p in active
+    )
+    print(f"Fallback chain: {chain}")
 
     # Read what other review bots already posted so our model corroborates and
     # adds what they missed instead of reviewing blind. Best-effort; default on.

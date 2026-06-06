@@ -149,13 +149,19 @@ jobs:
           # built-in Actions token with models:read).
           GH_MODELS_TOKEN: ${{ secrets.MODELS_TOKEN != '' && secrets.MODELS_TOKEN || secrets.GITHUB_TOKEN }}
           # Optional external free-tier providers (add redundancy when set).
+          # A *_2 key is a second account for the same provider — the script
+          # rotates to it on a 429, ~doubling that provider's free capacity.
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_API_KEY_2: ${{ secrets.GROQ_API_KEY_2 }}
           CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+          CEREBRAS_API_KEY_2: ${{ secrets.CEREBRAS_API_KEY_2 }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_API_KEY_2: ${{ secrets.NVIDIA_API_KEY_2 }}
           COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+          COHERE_API_KEY_2: ${{ secrets.COHERE_API_KEY_2 }}
           # Cloudflare Workers AI needs the account id in its URL — stays
           # dormant until CLOUDFLARE_ACCOUNT_ID is also set.
           CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
