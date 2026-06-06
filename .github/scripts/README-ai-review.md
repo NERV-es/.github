@@ -62,6 +62,26 @@ account id in the URL, so it needs **both** `CLOUDFLARE_API_KEY` **and**
 `CLOUDFLARE_ACCOUNT_ID` (the 32-hex id from your Cloudflare dashboard URL /
 right sidebar). The provider auto-skips until both are present.
 
+## Large PRs: chunked review
+
+A normal-sized PR is a single cheap call (the fallback chain above). When a diff
+is bigger than the top provider's budget, the script switches to **chunked
+review** instead of silently truncating: the diff is split on file boundaries and
+each chunk is reviewed independently, then merged into one comment with per-chunk
+attribution. Controlled by reusable inputs / env:
+
+| Input / env | Default | Meaning |
+| --- | --- | --- |
+| `chunk_strategy` / `CHUNK_STRATEGY` | `crossprovider` | `keep` = truncate to one provider; `sequential` = many chunks via the **same** provider; `crossprovider` = each chunk to a **different** provider |
+| `max_review_chunks` / `MAX_REVIEW_CHUNKS` | `4` | Cap on pieces a big PR is split into (bounds free-tier usage) |
+| `CHUNK_MAX_CHARS` | `24000` | Target size per chunk |
+
+`crossprovider` (default) gives **full coverage of large PRs** *and* **spreads
+free-tier load** — each provider only handles ~1/N of the diff, so no single free
+tier gets exhausted on a big PR. Set `chunk_strategy: keep` to go back to the
+cheapest single-call behavior (large PRs partly truncated). Verified live: a 52KB
+PR split into 3 chunks reviewed by Cerebras + NVIDIA + Groq.
+
 Free-tier gotchas baked into the script: Groq/Cerebras 403 (Cloudflare err 1010)
 the default urllib User-Agent → a normal UA header is sent; Cerebras free models
 are `gpt-oss-120b`/`zai-glm-4.7` (no llama); Groq free tier is ~12k TPM, so its
