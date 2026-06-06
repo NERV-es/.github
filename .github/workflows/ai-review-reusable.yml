@@ -145,6 +145,12 @@ jobs:
       # GH_MODELS_TOKEN (MODELS_TOKEN or the built-in token) further down.
       - name: Generate app token (bobby-claws)
         id: app-token
+        # The App creds are ORG secrets, which a FREE org does NOT expose to
+        # PRIVATE repos (same limit as the provider keys). So this step is gated
+        # on the secret being visible; when it isn't (e.g. on private NERV-es/NERV
+        # via the self-hosted runner) we fall back to the built-in GITHUB_TOKEN
+        # below and post as github-actions[bot] instead of bobby-claws.
+        if: ${{ secrets.NERV_APP_ID != '' && secrets.NERV_APP_PRIVATE_KEY != '' }}
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.NERV_APP_ID }}
@@ -156,7 +162,7 @@ jobs:
       - name: Resolve PR context
         id: ctx
         env:
-          TOKEN: ${{ steps.app-token.outputs.token }}
+          TOKEN: ${{ steps.app-token.outputs.token != '' && steps.app-token.outputs.token || github.token }}
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -195,7 +201,7 @@ jobs:
           repository: NERV-es/.github
           ref: ${{ inputs.reviewer_ref }}
           path: .nerv-github
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.app-token.outputs.token != '' && steps.app-token.outputs.token || github.token }}
           persist-credentials: false
 
       - name: Build PR diff
@@ -223,7 +229,7 @@ jobs:
       - name: Multi-LLM review
         env:
           # Post the review (and read peer bot comments) AS the bobby-claws App.
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token != '' && steps.app-token.outputs.token || github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ steps.ctx.outputs.pr_number }}
           HEAD_SHA: ${{ steps.ctx.outputs.head_sha }}
