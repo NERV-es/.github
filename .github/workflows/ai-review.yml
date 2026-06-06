@@ -14,5 +14,5 @@ permissions:
 
 jobs:
   review:
-    uses: NERV-es/.github/.github/workflows/ai-review-reusable.yml@62b60f00abd929d15fb73801d8c30e9990a0ff9a
+    uses: NERV-es/.github/.github/workflows/ai-review-reusable.yml@0d85cf94394682b3625a8b18d6fe05aa085ab2fd
     secrets: inherit
