@@ -63,6 +63,11 @@ on:
         type: number
         required: false
         default: 20
+      runs-on:
+        description: 'Runner label for the job (e.g. ubuntu-latest, or self-hosted for a private repo).'
+        type: string
+        required: false
+        default: 'ubuntu-latest'
   workflow_dispatch:
     inputs:
       run:
@@ -107,6 +112,11 @@ on:
         type: number
         required: false
         default: 20
+      runs-on:
+        description: 'Runner label for the job (e.g. ubuntu-latest, or self-hosted for a private repo).'
+        type: string
+        required: false
+        default: 'ubuntu-latest'
 
 permissions:
   contents: read
@@ -117,12 +127,14 @@ concurrency:
 
 jobs:
   open-pr:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs-on }}
     permissions:
       contents: write
       pull-requests: write
     steps:
       - name: Harden runner
+        # harden-runner is GitHub-hosted-Ubuntu only; skip it on self-hosted.
+        if: runner.environment == 'github-hosted'
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: audit
