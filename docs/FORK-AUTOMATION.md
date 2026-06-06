@@ -110,3 +110,51 @@ Set `auto-merge: false` to leave the PR open for manual review. It is purely
 additive — the existing direct-push automations (upstream-sync, stub-drift-
 enforcer) are unchanged; point new maintenance jobs at this when you want a
 reviewable PR instead of a silent commit.
+
+## Self-hosted runner for private-repo CI (free)
+
+`NERV-es/NERV` is **private**, so its GitHub-hosted Actions minutes are metered.
+When the account hits a spending-limit/billing block, every private workflow
+(CI, scanners, `weekly-maintenance`) fails to start. A **self-hosted runner**
+sidesteps the meter: jobs run for free on your own Linux box.
+
+Routing is surgical — only NERV opts in:
+
+* `open-app-pr-reusable.yml` exposes a `runs-on` input (default `ubuntu-latest`).
+  Public forks keep using GitHub-hosted runners.
+* `NERV-es/NERV`'s `weekly-maintenance.yml` passes `runs-on: self-hosted`, so
+  only it targets the self-hosted runner.
+* The reusable's `harden-runner` step is GitHub-hosted-only
+  (`if: runner.environment == 'github-hosted'`) so it never breaks self-hosted.
+
+### Provision the host
+
+1. Create a free Linux VM — e.g. an **Oracle Cloud Always-Free Ampere A1**
+   (aarch64) or x86 micro instance, Ubuntu 22.04+. Keep it on 24/7 so the
+   Monday cron always has a runner.
+2. On the VM, register the org runner (mints a registration token via the
+   bobby-claw PAT, downloads + installs the runner as a systemd service):
+
+   ```bash
+   # Option A: copy your PAT file to the VM, then:
+   bash setup-actions-runner.sh
+   # Option B: paste a UI-minted registration token, no PAT on the VM:
+   RUNNER_TOKEN=XXXX bash setup-actions-runner.sh
+   ```
+
+   The script (`scripts/setup-actions-runner.sh` in the NERV repo) is
+   arch-aware (x64/arm64) and labels the runner `self-hosted,linux,nerv`.
+3. Confirm it is online:
+
+   ```bash
+   gh api /orgs/NERV-es/actions/runners \
+     --jq '.runners[] | {name, status, labels: [.labels[].name]}'
+   ```
+4. Dispatch the Monday job to prove it green:
+
+   ```bash
+   gh workflow run weekly-maintenance.yml -R NERV-es/NERV
+   ```
+
+The runner serves **all** NERV-es private repos (org-level, `Default` group),
+so any future private workflow can adopt `runs-on: self-hosted` the same way.
