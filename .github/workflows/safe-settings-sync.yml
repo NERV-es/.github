@@ -1,0 +1,56 @@
+# Safe Settings — scheduled org-wide settings sync (no server required).
+#
+# Runs github/safe-settings in "full-sync" mode via GitHub Actions, enforcing
+# the org-level config in this repo (.github/settings.yml) on every NERV-es
+# fork. Drift (someone flips a repo setting or branch-protection rule by hand)
+# is corrected on the next run.
+#
+# One-time setup (see docs/SAFE-SETTINGS-SETUP.md):
+#   1. Create a GitHub App in the NERV-es org and install it on all repos.
+#   2. Add two repo secrets here:
+#        SAFE_SETTINGS_APP_ID       — the App's numeric ID
+#        SAFE_SETTINGS_PRIVATE_KEY  — the App's downloaded .pem private key
+name: Safe Settings Sync
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  safe-settings-sync:
+    runs-on: ubuntu-latest
+    env:
+      SAFE_SETTINGS_VERSION: "2.1.21"
+      SAFE_SETTINGS_CODE_DIR: ${{ github.workspace }}/.safe-settings-code
+    steps:
+      # Admin repo checkout (this repo) — provides deployment-settings.yml.
+      - uses: actions/checkout@v4
+
+      # safe-settings source, pinned to a release tag.
+      - uses: actions/checkout@v4
+        with:
+          repository: github/safe-settings
+          ref: ${{ env.SAFE_SETTINGS_VERSION }}
+          path: .safe-settings-code
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - run: npm ci || npm install
+        working-directory: ${{ env.SAFE_SETTINGS_CODE_DIR }}
+
+      - name: Full sync
+        working-directory: ${{ env.SAFE_SETTINGS_CODE_DIR }}
+        env:
+          GH_ORG: NERV-es
+          APP_ID: ${{ secrets.SAFE_SETTINGS_APP_ID }}
+          PRIVATE_KEY: ${{ secrets.SAFE_SETTINGS_PRIVATE_KEY }}
+          ADMIN_REPO: .github
+          CONFIG_PATH: .github
+          DEPLOYMENT_CONFIG_FILE: ${{ github.workspace }}/deployment-settings.yml
+        run: npm run full-sync

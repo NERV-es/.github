@@ -1,0 +1,10 @@
+# Runtime scope for github/safe-settings (read locally during full-sync).
+#
+# restrictedRepos lists repos in the org that safe-settings must NOT touch.
+# The three admin-type repos below are the safe-settings defaults; listing
+# them explicitly keeps the org config repo from managing itself. Every other
+# repo in NERV-es (the forks) is managed by .github/settings.yml.
+restrictedRepos:
+  - admin
+  - .github
+  - safe-settings
