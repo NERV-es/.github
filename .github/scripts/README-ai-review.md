@@ -89,6 +89,25 @@ diff budget is the smallest; Gemini/OpenRouter `:free` often 429 (retried, then
 skipped) so they sit near the end. NVIDIA NIM, Cohere (`/compatibility/v1`), and
 Cloudflare Workers AI are all OpenAI-compatible and validated live.
 
+## Peer context: reading other bots' reviews
+
+Before calling a model, the script GETs the PR's issue comments **and** PR
+reviews and folds in what other *review* bots (CodeRabbit, Sourcery, Qodo,
+Cubic, Korbit, Greptile, Copilot's reviewer, Gemini Code Assist, …) already
+said. That context is appended to the prompt with an instruction to **confirm,
+de-duplicate, and add what they missed** — so our review builds on the others
+instead of repeating them. Pure scan/report bots (Socket, SafeDep, GuardRails,
+…) are ignored as noise, and our own prior comment is skipped.
+
+| Knob | Default | Meaning |
+| --- | --- | --- |
+| `peer_context` / `PEER_CONTEXT` | `true` / `1` | `false`/`0` disables peer reading |
+| `PEER_CONTEXT_MAX_CHARS` | `3500` | Total budget for the folded-in peer block |
+
+It's best-effort: any API hiccup is logged and the review proceeds without it.
+Validated live on `NERV-es/atoll#23` — folded in CodeRabbit + Sourcery + Qodo
+and the model corroborated their findings without parroting them.
+
 ## Optional: webhook out to the homelab
 
 When `AGENTGATEWAY_WEBHOOK_URL` is set the reusable's `webhook-out` job also POSTs

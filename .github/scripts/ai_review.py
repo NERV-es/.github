@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -60,6 +61,21 @@ HTTP_TIMEOUT = 90
 CHUNK_STRATEGY_DEFAULT = "crossprovider"
 MAX_REVIEW_CHUNKS_DEFAULT = 4
 CHUNK_MAX_CHARS_DEFAULT = 24_000
+
+# Peer context: read what OTHER review bots already posted on the PR and feed it
+# to our model so it can corroborate, de-duplicate, and surface what they missed
+# instead of reviewing in a vacuum. Toggle with PEER_CONTEXT=0.
+#   PEER_CONTEXT            "0"/"false" disables (default on)
+#   PEER_CONTEXT_MAX_CHARS  total budget for the peer block (default 3500)
+PEER_CONTEXT_MAX_CHARS_DEFAULT = 3_500
+PEER_PER_BOT_CHARS = 1_200
+# Logins (substring match) we treat as actual *reviewers* — not scan/report bots
+# (socket/safedep/guardrails/etc.) whose comments are noise as review context.
+REVIEW_BOTS = (
+    "coderabbit", "sourcery", "kilo", "qodo", "cubic", "amazon-q", "deepscan",
+    "codefactor", "codeclimate", "qlty", "korbit", "ellipsis", "greptile",
+    "bito", "codacy", "copilot-pull-request-reviewer", "gemini-code-assist",
+)
 
 # Each provider is an OpenAI-compatible chat endpoint. `env` is the secret name;
 # a provider is simply skipped when its key is absent (the repo's key-gated
@@ -170,10 +186,12 @@ def http_post_json(url: str, headers: dict, payload: dict, timeout: int) -> dict
         return json.loads(resp.read().decode("utf-8"))
 
 
-def review_with(provider: dict, diff: str, budget: int) -> str | None:
+def review_with(provider: dict, diff: str, budget: int, peer_context: str = "") -> str | None:
     """Call one provider. Returns the review text, or None if it's unavailable
     (no key, missing account id, rate-limited past retries, or any error) so the
-    caller can fall through to the next provider in the chain."""
+    caller can fall through to the next provider in the chain. `peer_context`, if
+    given, is what other review bots already said — passed in so our model builds
+    on it rather than duplicating it."""
     key = os.environ.get(provider["env"], "").strip()
     if not key:
         return None
@@ -188,6 +206,14 @@ def review_with(provider: dict, diff: str, budget: int) -> str | None:
         url = url.format(account_id=acct)
     if len(diff) > budget:
         diff = diff[:budget]
+    user_content = "Review this pull-request diff:\n\n```diff\n" + diff + "\n```"
+    if peer_context:
+        user_content += (
+            "\n\nOther automated reviewers have already commented on this PR "
+            "(below). Use them as context: confirm the real ones, do NOT repeat "
+            "what they already covered well, and focus on adding what they MISSED "
+            "or got wrong. Ignore their style/noise.\n\n" + peer_context
+        )
     headers = {
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
@@ -201,10 +227,7 @@ def review_with(provider: dict, diff: str, budget: int) -> str | None:
         "max_tokens": 1200,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": "Review this pull-request diff:\n\n```diff\n" + diff + "\n```",
-            },
+            {"role": "user", "content": user_content},
         ],
     }
     # Retry on 429 with Retry-After backoff (mirrors scripts/ai_resolve.py).
@@ -275,6 +298,56 @@ def upsert_comment(repo: str, pr: str, token: str, body: str) -> None:
         print("Posted new review comment.")
 
 
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
+def gather_peer_reviews(repo: str, pr: str, token: str, max_total: int) -> str:
+    """Collect what other *review* bots already posted on this PR (issue comments
+    + PR reviews), so our model can build on them. Skips our own comment and
+    pure scan/report bots. Returns a formatted block (or '' if none)."""
+    collected: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def consider(login: str, raw_body: str | None) -> None:
+        if not raw_body or MARKER in raw_body or login in seen:
+            return
+        low = login.lower()
+        if not any(b in low for b in REVIEW_BOTS):
+            return
+        text = _HTML_COMMENT.sub("", raw_body).strip()
+        if len(text) < 40:  # skip empty / status-only comments
+            return
+        collected.append((login, text[:PEER_PER_BOT_CHARS]))
+        seen.add(login)
+
+    endpoints = (
+        f"https://api.github.com/repos/{repo}/issues/{pr}/comments?per_page=100",
+        f"https://api.github.com/repos/{repo}/pulls/{pr}/reviews?per_page=100",
+    )
+    for url in endpoints:
+        try:
+            for item in gh_api("GET", url, token):
+                user = item.get("user") or {}
+                if user.get("type") == "Bot":
+                    consider(user.get("login", ""), item.get("body"))
+        except Exception as e:  # noqa: BLE001 — peer context is best-effort
+            print(f"  peer context: could not read {url.split('/')[-1]}: {e}", flush=True)
+
+    if not collected:
+        return ""
+    parts: list[str] = []
+    total = 0
+    for login, text in collected:
+        block = f"--- {login} said ---\n{text}"
+        if total + len(block) > max_total:
+            break
+        parts.append(block)
+        total += len(block)
+    print(f"Peer context: folded in {len(parts)} prior bot review(s): "
+          f"{', '.join(l for l, _ in collected[:len(parts)])}")
+    return "\n\n".join(parts)
+
+
 def split_diff_by_file(diff: str) -> list[tuple[str, str]]:
     """Split a unified diff into (filename, text) segments on `diff --git`
     boundaries so chunks stay file-coherent rather than cutting mid-hunk."""
@@ -321,13 +394,13 @@ def pack_chunks(segments: list[tuple[str, str]], n_chunks: int, cap: int) -> lis
     return chunks
 
 
-def single_review(diff: str, active: list[dict], max_diff_chars: int) -> tuple[dict | None, str | None, int, list[str]]:
+def single_review(diff: str, active: list[dict], max_diff_chars: int, peer_context: str = "") -> tuple[dict | None, str | None, int, list[str]]:
     """Fallback chain: try providers top-down, return the first usable review."""
     tried: list[str] = []
     for provider in active:
         budget = min(max_diff_chars, provider.get("max_chars", max_diff_chars))
         print(f"Trying {provider['name']} (budget {budget:,} chars)...")
-        out = review_with(provider, diff, budget)
+        out = review_with(provider, diff, budget, peer_context)
         if out:
             return provider, out, budget, tried
         tried.append(provider["name"])
@@ -335,7 +408,7 @@ def single_review(diff: str, active: list[dict], max_diff_chars: int) -> tuple[d
     return None, None, max_diff_chars, tried
 
 
-def review_chunks(chunks: list[dict], active: list[dict], cross: bool, max_diff_chars: int) -> list[dict]:
+def review_chunks(chunks: list[dict], active: list[dict], cross: bool, max_diff_chars: int, peer_context: str = "") -> list[dict]:
     """Review each chunk. `cross` spreads chunks across DIFFERENT providers
     (preferring as-yet-unused ones); otherwise it sticks to one provider,
     falling back only if that provider fails. Each chunk independently falls
@@ -357,7 +430,7 @@ def review_chunks(chunks: list[dict], active: list[dict], cross: bool, max_diff_
         chosen = None
         for p in order:
             budget = min(max_diff_chars, p.get("max_chars", max_diff_chars))
-            out = review_with(p, ch["text"], budget)
+            out = review_with(p, ch["text"], budget, peer_context)
             if out:
                 review, chosen = out, p
                 used.add(p["name"])
@@ -413,6 +486,17 @@ def main() -> int:
 
     print(f"Fallback chain: {' -> '.join(p['name'] for p in active)}")
 
+    # Read what other review bots already posted so our model corroborates and
+    # adds what they missed instead of reviewing blind. Best-effort; default on.
+    peer_context = ""
+    if os.environ.get("PEER_CONTEXT", "1").strip().lower() not in ("0", "false", "no", "off"):
+        peer_max = _env_int("PEER_CONTEXT_MAX_CHARS", PEER_CONTEXT_MAX_CHARS_DEFAULT, 500, 12_000)
+        try:
+            peer_context = gather_peer_reviews(repo, pr, token, peer_max)
+        except Exception as e:  # noqa: BLE001 — never let peer context block a review
+            print(f"Peer context gathering failed (continuing without it): {e}")
+    n_peers = peer_context.count("--- ") if peer_context else 0
+
     # Big-PR mode only kicks in when the diff overflows the TOP provider's budget
     # AND chunking is enabled AND we can actually split usefully. Otherwise normal
     # PRs stay a single cheap call.
@@ -433,7 +517,7 @@ def main() -> int:
             n_chunks = min(n_chunks, len(active))
         chunks = pack_chunks(split_diff_by_file(diff), n_chunks, chunk_cap)
         print(f"Big PR ({len(diff):,} chars) -> {strategy} chunking into {len(chunks)} pieces.")
-        results = review_chunks(chunks, active, cross, max_diff_chars)
+        results = review_chunks(chunks, active, cross, max_diff_chars, peer_context)
         sections = []
         ok = 0
         for r in results:
@@ -453,11 +537,13 @@ def main() -> int:
             "## 🤖 AI review (chunked)\n"
             f"_Large PR ({len(diff):,} chars) split into {len(chunks)} parts "
             f"{'across providers' if cross else 'via ' + (results[0]['provider']['name'] if results[0]['provider'] else 'provider')} "
-            "for full coverage — free-tier, advisory only._\n\n"
+            "for full coverage — free-tier, advisory only."
+            + (f" Considered {n_peers} prior bot review(s)." if n_peers else "")
+            + "_\n\n"
             + "\n\n---\n\n".join(sections)
         )
     else:
-        chosen, review, chosen_budget, tried = single_review(diff, active, max_diff_chars)
+        chosen, review, chosen_budget, tried = single_review(diff, active, max_diff_chars, peer_context)
         if not review or chosen is None:
             print("All providers in the chain were unavailable — no review posted.")
             return 0
@@ -467,6 +553,8 @@ def main() -> int:
             notes.append("fell back past " + ", ".join(tried))
         if truncated:
             notes.append(f"diff truncated to the first {chosen_budget:,} chars for context")
+        if n_peers:
+            notes.append(f"considered {n_peers} prior bot review(s)")
         footer = (
             f"\n\n---\n_Reviewed by **{chosen['name']}** · free-tier fallback chain, "
             "advisory only"

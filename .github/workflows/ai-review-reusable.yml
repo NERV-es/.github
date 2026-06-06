@@ -42,6 +42,10 @@ on:
         description: Max pieces a large PR is split into (bounds free-tier usage).
         type: number
         default: 4
+      peer_context:
+        description: Read other review bots' comments on the PR and feed them to the model (corroborate + add what they missed).
+        type: boolean
+        default: true
       reviewer_ref:
         description: Ref of NERV-es/.github to fetch ai_review.py from (keep in lockstep with the pinned tag).
         type: string
@@ -135,6 +139,7 @@ jobs:
           MAX_DIFF_CHARS: ${{ inputs.max_diff_chars }}
           CHUNK_STRATEGY: ${{ inputs.chunk_strategy }}
           MAX_REVIEW_CHUNKS: ${{ inputs.max_review_chunks }}
+          PEER_CONTEXT: ${{ inputs.peer_context && '1' || '0' }}
           # Zero-config default provider — always present (falls back to the
           # built-in Actions token with models:read).
           GH_MODELS_TOKEN: ${{ secrets.MODELS_TOKEN != '' && secrets.MODELS_TOKEN || secrets.GITHUB_TOKEN }}
