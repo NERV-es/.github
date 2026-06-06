@@ -1,0 +1,42 @@
+# Managed by github/safe-settings (https://github.com/github/safe-settings).
+#
+# This is the ORG-LEVEL config for the NERV-es organization. When the
+# safe-settings GitHub App is installed, point its admin/config repo at
+# NERV-es/.github (set ADMIN_REPO=.github if not using the default `admin`
+# repo). These defaults are then enforced on every repo in the org, giving
+# one source of truth for settings + branch protection across all forks.
+#
+# Mirrors scripts/repo-sync.sh / config/fork-settings.json in the NERV repo.
+repository:
+  has_wiki: false
+  has_projects: false
+  has_issues: true
+  allow_squash_merge: true
+  allow_merge_commit: true
+  allow_rebase_merge: true
+  allow_auto_merge: true
+  delete_branch_on_merge: true
+
+labels:
+  - name: dependencies
+    color: "0366d6"
+    description: Dependency updates (Renovate)
+  - name: stale
+    color: "ededed"
+    description: Inactive; will be auto-closed
+
+branches:
+  - name: main
+    protection:
+      required_pull_request_reviews:
+        required_approving_review_count: 0
+        dismiss_stale_reviews: false
+        require_code_owner_reviews: false
+      required_status_checks:
+        strict: false
+        contexts: []
+      enforce_admins: false
+      required_linear_history: true
+      restrictions: null
+      allow_force_pushes: false
+      allow_deletions: false
