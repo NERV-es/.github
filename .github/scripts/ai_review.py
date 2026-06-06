@@ -77,6 +77,25 @@ REVIEW_BOTS = (
     "bito", "codacy", "copilot-pull-request-reviewer", "gemini-code-assist",
 )
 
+# Synthesis ("reduce") pass: after the diff review(s) are drafted, hand the SMALL
+# combined text — our own draft review(s) + the other bots' summaries — to a
+# MEDIUM-budget provider to merge into one deduplicated, severity-ranked final
+# review. Rationale for the tiering the user asked for:
+#   * big-budget providers stay reserved for the expensive full-diff pass;
+#   * medium-budget providers get this cheap summaries-only job (the input is
+#     tiny, so their smaller context window is irrelevant);
+#   * GitHub Models / chronic-429 providers remain the last-resort safety net.
+# It only fires when there's actually >1 thing to merge (a chunked review, or a
+# single review plus peer context) — a plain small PR with no peers stays a
+# single call. Toggle with SYNTHESIZE=0.
+#   SYNTHESIZE          "0"/"false" disables (default on)
+#   SYNTH_MAX_CHARS     cap on the combined draft text fed to the reducer
+SYNTH_MAX_CHARS_DEFAULT = 16_000
+# Providers whose max_chars falls in this band are "medium" — preferred for the
+# cheap synthesis call so the big-budget ones are saved for full-diff reviews.
+SYNTH_MEDIUM_LO = 15_000
+SYNTH_MEDIUM_HI = 30_000
+
 # Each provider is an OpenAI-compatible chat endpoint. `env` is the secret name;
 # a provider is simply skipped when its key is absent (the repo's key-gated
 # convention, enforced one layer up by the workflow's guard job).
@@ -186,12 +205,11 @@ def http_post_json(url: str, headers: dict, payload: dict, timeout: int) -> dict
         return json.loads(resp.read().decode("utf-8"))
 
 
-def review_with(provider: dict, diff: str, budget: int, peer_context: str = "") -> str | None:
-    """Call one provider. Returns the review text, or None if it's unavailable
-    (no key, missing account id, rate-limited past retries, or any error) so the
-    caller can fall through to the next provider in the chain. `peer_context`, if
-    given, is what other review bots already said — passed in so our model builds
-    on it rather than duplicating it."""
+def _chat(provider: dict, messages: list[dict], max_tokens: int = 1200) -> str | None:
+    """Shared OpenAI-compatible chat call with the chain's None-on-failure
+    semantics and 429 backoff. Returns the assistant text or None (no key,
+    missing account id, rate-limited past retries, or any error) so callers can
+    fall through to the next provider."""
     key = os.environ.get(provider["env"], "").strip()
     if not key:
         return None
@@ -204,16 +222,6 @@ def review_with(provider: dict, diff: str, budget: int, peer_context: str = "") 
         if not acct:
             return None
         url = url.format(account_id=acct)
-    if len(diff) > budget:
-        diff = diff[:budget]
-    user_content = "Review this pull-request diff:\n\n```diff\n" + diff + "\n```"
-    if peer_context:
-        user_content += (
-            "\n\nOther automated reviewers have already commented on this PR "
-            "(below). Use them as context: confirm the real ones, do NOT repeat "
-            "what they already covered well, and focus on adding what they MISSED "
-            "or got wrong. Ignore their style/noise.\n\n" + peer_context
-        )
     headers = {
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
@@ -224,11 +232,8 @@ def review_with(provider: dict, diff: str, budget: int, peer_context: str = "") 
     payload = {
         "model": provider["model"],
         "temperature": 0.1,
-        "max_tokens": 1200,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
+        "max_tokens": max_tokens,
+        "messages": messages,
     }
     # Retry on 429 with Retry-After backoff (mirrors scripts/ai_resolve.py).
     for attempt in range(3):
@@ -261,6 +266,26 @@ def review_with(provider: dict, diff: str, budget: int, peer_context: str = "") 
             print(f"  {provider['name']}: error — {e}", flush=True)
             return None
     return None
+
+
+def review_with(provider: dict, diff: str, budget: int, peer_context: str = "") -> str | None:
+    """Call one provider to review a diff. `peer_context`, if given, is what other
+    review bots already said — passed in so our model builds on it rather than
+    duplicating it. Returns the review text or None (caller falls through)."""
+    if len(diff) > budget:
+        diff = diff[:budget]
+    user_content = "Review this pull-request diff:\n\n```diff\n" + diff + "\n```"
+    if peer_context:
+        user_content += (
+            "\n\nOther automated reviewers have already commented on this PR "
+            "(below). Use them as context: confirm the real ones, do NOT repeat "
+            "what they already covered well, and focus on adding what they MISSED "
+            "or got wrong. Ignore their style/noise.\n\n" + peer_context
+        )
+    return _chat(provider, [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ])
 
 
 def gh_api(method: str, url: str, token: str, payload: dict | None = None) -> dict:
@@ -441,6 +466,70 @@ def review_chunks(chunks: list[dict], active: list[dict], cross: bool, max_diff_
     return results
 
 
+SYNTH_SYSTEM_PROMPT = (
+    "You are the lead reviewer consolidating several draft code reviews of the "
+    "SAME pull request (some from our own models per-chunk, some from other "
+    "automated reviewers) into ONE final review. Rules: (1) PRESERVE every "
+    "distinct real issue any draft raised — especially compile-breaking ones "
+    "like leftover merge-conflict markers, undefined symbols, or syntax errors; "
+    "losing a real finding is the worst outcome. (2) Merge only EXACT duplicates "
+    "of the same issue, keeping the clearest file:line. (3) Drop only pure "
+    "style/formatting/naming noise. (4) Order by severity, blocking first. "
+    "(5) Keep each point to one terse bullet citing file:line. (6) Do NOT invent "
+    "issues not present in the drafts. Reply 'No blocking issues.' ONLY if NONE "
+    "of the drafts reported a real bug, security, logic, or compile problem."
+)
+
+
+def synthesize_reviews(active: list[dict], drafts: str, max_chars: int) -> tuple[dict | None, str | None]:
+    """Reduce step: a MEDIUM-budget provider merges the combined draft reviews +
+    peer summaries (`drafts`) into one deduped, severity-ranked review. Medium
+    providers are tried first (this job's input is tiny, so big budgets are
+    wasted on it and better saved for full-diff passes); then the rest of the
+    chain; GitHub Models stays the final safety net. Returns (provider, text) or
+    (None, None) if every provider was unavailable."""
+    if len(drafts) > max_chars:
+        drafts = drafts[:max_chars]
+    medium = [p for p in active if SYNTH_MEDIUM_LO <= p.get("max_chars", 0) <= SYNTH_MEDIUM_HI]
+    rest = [p for p in active if p not in medium]
+    order = medium + rest
+    user = (
+        "Consolidate these draft reviews of one pull request into a single final "
+        "review:\n\n" + drafts
+    )
+    for p in order:
+        out = _chat(p, [
+            {"role": "system", "content": SYNTH_SYSTEM_PROMPT},
+            {"role": "user", "content": user},
+        ], max_tokens=1600)
+        if out:
+            return p, out
+        print(f"  synthesis: {p['name']} unavailable, falling through.")
+    return None, None
+
+
+# Signals that a draft contained a genuinely blocking finding. Used to veto a
+# synthesis that collapses to "no blocking issues" while the raw parts clearly
+# reported real problems — losing a finding in the merge is unacceptable.
+_BLOCKING_HINTS = (
+    "conflict marker", "<<<<<<<", ">>>>>>>", "undefined", "syntax error",
+    "won't compile", "will not compile", "does not compile", "compile error",
+    "security", "vulnerab", "data loss", "crash", "race condition", "null pointer",
+    "unresolved", "broken",
+)
+
+
+def _synthesis_dropped_findings(merged: str, drafts: str) -> bool:
+    """True when the merged review says nothing-blocking but the drafts plainly
+    reported a blocking issue — i.e. the reducer silently lost signal."""
+    m = merged.strip().lower()
+    said_clean = m.startswith("no blocking") or (len(m) < 60 and "blocking" in m)
+    if not said_clean:
+        return False
+    d = drafts.lower()
+    return any(h in d for h in _BLOCKING_HINTS)
+
+
 def _env_int(name: str, default: int, lo: int, hi: int) -> int:
     raw = os.environ.get(name, "").strip()
     if raw.isdigit():
@@ -497,6 +586,9 @@ def main() -> int:
             print(f"Peer context gathering failed (continuing without it): {e}")
     n_peers = peer_context.count("--- ") if peer_context else 0
 
+    synth_on = os.environ.get("SYNTHESIZE", "1").strip().lower() not in ("0", "false", "no", "off")
+    synth_max = _env_int("SYNTH_MAX_CHARS", SYNTH_MAX_CHARS_DEFAULT, 2_000, 40_000)
+
     # Big-PR mode only kicks in when the diff overflows the TOP provider's budget
     # AND chunking is enabled AND we can actually split usefully. Otherwise normal
     # PRs stay a single cheap call.
@@ -532,16 +624,55 @@ def main() -> int:
         if ok == 0:
             print("All chunk reviews failed — no review posted.")
             return 0
-        body = (
-            f"{MARKER}\n"
-            "## 🤖 AI review (chunked)\n"
-            f"_Large PR ({len(diff):,} chars) split into {len(chunks)} parts "
-            f"{'across providers' if cross else 'via ' + (results[0]['provider']['name'] if results[0]['provider'] else 'provider')} "
-            "for full coverage — free-tier, advisory only."
-            + (f" Considered {n_peers} prior bot review(s)." if n_peers else "")
-            + "_\n\n"
-            + "\n\n---\n\n".join(sections)
-        )
+
+        # Reduce step: when >1 chunk produced a review, merge the fragmented
+        # per-part output (plus any peer summaries) into ONE coherent, deduped
+        # review via a medium-budget provider. Raw parts are kept collapsed for
+        # traceability. Only fires here — normal single-provider PRs already get
+        # peer context inline and don't need a second call.
+        merged = None
+        merged_by = None
+        if synth_on and ok > 1:
+            draft_blocks = [s for r, s in zip(results, sections) if r["review"]]
+            drafts = "\n\n".join(draft_blocks)
+            if peer_context:
+                drafts += "\n\n### Other automated reviewers\n\n" + peer_context
+            print(f"Synthesizing {ok} chunk reviews"
+                  + (f" + {n_peers} bot review(s)" if n_peers else "") + " into one...")
+            sp, merged = synthesize_reviews(active, drafts, synth_max)
+            merged_by = sp["name"] if sp else None
+            if merged and _synthesis_dropped_findings(merged, drafts):
+                print("Synthesis collapsed real findings — discarding merge, "
+                      "posting per-part reviews instead.")
+                merged = None
+                merged_by = None
+
+        if merged and merged_by:
+            details = "\n\n".join(sections)
+            body = (
+                f"{MARKER}\n"
+                "## 🤖 AI review\n"
+                f"_Large PR ({len(diff):,} chars) reviewed in {len(chunks)} parts "
+                f"{'across providers' if cross else 'sequentially'}, then merged by "
+                f"**{merged_by}** — free-tier, advisory only."
+                + (f" Considered {n_peers} prior bot review(s)." if n_peers else "")
+                + "_\n\n"
+                + merged
+                + "\n\n<details><summary>Per-part raw reviews</summary>\n\n"
+                + details
+                + "\n\n</details>"
+            )
+        else:
+            body = (
+                f"{MARKER}\n"
+                "## 🤖 AI review (chunked)\n"
+                f"_Large PR ({len(diff):,} chars) split into {len(chunks)} parts "
+                f"{'across providers' if cross else 'via ' + (results[0]['provider']['name'] if results[0]['provider'] else 'provider')} "
+                "for full coverage — free-tier, advisory only."
+                + (f" Considered {n_peers} prior bot review(s)." if n_peers else "")
+                + "_\n\n"
+                + "\n\n---\n\n".join(sections)
+            )
     else:
         chosen, review, chosen_budget, tried = single_review(diff, active, max_diff_chars, peer_context)
         if not review or chosen is None:

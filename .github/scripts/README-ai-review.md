@@ -108,6 +108,34 @@ It's best-effort: any API hiccup is logged and the review proceeds without it.
 Validated live on `NERV-es/atoll#23` — folded in CodeRabbit + Sourcery + Qodo
 and the model corroborated their findings without parroting them.
 
+## Synthesis: merging chunked reviews into one
+
+When a big PR is reviewed in multiple chunks (see above), the per-part output is
+fragmented ("Part 1 … Part 2 …"). The synthesis pass fixes that: it hands the
+**small** combined text — the draft chunk reviews **plus** the other bots'
+summaries — to a **medium-budget** provider (Groq/Cloudflare/Mistral/OpenRouter)
+to merge into ONE deduplicated, severity-ranked final review. The per-part raw
+reviews are kept in a collapsed `<details>` for traceability.
+
+This is the tiering by design: big-budget providers do the expensive full-diff
+chunk passes; medium-budget providers do this cheap summaries-only reduce (its
+input is tiny, so their smaller window doesn't matter); GitHub Models / chronic
+429-ers stay the last-resort safety net. It only fires when there's >1 chunk to
+merge — a normal single-provider PR already folds peer context inline and skips
+the extra call (cost-aware).
+
+| Knob | Default | Meaning |
+| --- | --- | --- |
+| `synthesize` / `SYNTHESIZE` | `true` / `1` | `false`/`0` posts the raw per-part reviews instead |
+| `SYNTH_MAX_CHARS` | `16000` | Cap on the combined draft text fed to the reducer |
+
+**Safety guard:** a synthesis that collapses to "no blocking issues" while the
+drafts clearly reported a blocking problem (merge-conflict markers, undefined
+symbols, security, …) is **vetoed** — the raw per-part reviews are posted
+instead, so the merge can never silently drop a real finding. Validated live on
+`NERV-es/atoll#23`: 3 cross-provider chunks + 3 bot reviews merged by Groq into
+one list that preserved every compile-breaking finding with file:line.
+
 ## Optional: webhook out to the homelab
 
 When `AGENTGATEWAY_WEBHOOK_URL` is set the reusable's `webhook-out` job also POSTs
