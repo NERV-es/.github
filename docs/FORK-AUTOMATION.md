@@ -158,3 +158,37 @@ Routing is surgical — only NERV opts in:
 
 The runner serves **all** NERV-es private repos (org-level, `Default` group),
 so any future private workflow can adopt `runs-on: self-hosted` the same way.
+
+### Auth on private repos (free-org gotcha)
+
+On a **free organization, org-level Actions secrets only reach _public_
+repos**. So `NERV-es/NERV` (private) cannot read the org `NERV_APP_ID` /
+`NERV_APP_PRIVATE_KEY` — `secrets: inherit` passes them through empty and the
+GitHub-App token step fails. Two ways the reusable handles bot auth:
+
+* **`bot-auth: app`** (default) — public repos use the Bobby-Claws App
+  (`bobby-claws[bot]` authorship). Org App secrets are visible to them.
+* **`bot-auth: pat`** — private repos pass a **repo-level** `BOT_PAT` secret
+  (a NERV-es PAT with `repo`). The reusable skips the App and authenticates
+  with the PAT; commits are authored by the PAT's account. Set it once:
+
+  ```bash
+  gh secret set BOT_PAT -R NERV-es/NERV --body "<nerv-es PAT>"
+  ```
+
+`NERV-es/NERV`'s `weekly-maintenance.yml` uses `bot-auth: pat` for this reason.
+
+### Container option (no separate VM)
+
+Instead of a cloud VM you can run the runner as a container on any box you
+already have a Docker daemon on (e.g. a colima host):
+
+```bash
+cd infra/actions-runner   # in the NERV repo
+cp .env.example .env       # put a repo+admin:org PAT in ACCESS_TOKEN
+docker compose up -d       # self-registers, restart: unless-stopped
+```
+
+It self-registers as an org runner labelled `self-hosted,linux,nerv`. Online
+only while that host + Docker are up — fine for on-demand jobs; for the Monday
+cron keep the host awake at that time.
