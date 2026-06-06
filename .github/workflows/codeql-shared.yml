@@ -19,4 +19,4 @@ jobs:
       contents: read
       security-events: write
       actions: read
-    uses: NERV-es/.github/.github/workflows/codeql-reusable.yml@d8650513515940879afbf1054d987acab7501cc1
+    uses: NERV-es/.github/.github/workflows/codeql-reusable.yml@f620bf567e49a31537497d5b8b063ca263e4fb15
