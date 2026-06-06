@@ -44,6 +44,22 @@ jobs:
       - run: npm ci || npm install
         working-directory: ${{ env.SAFE_SETTINGS_CODE_DIR }}
 
+      # Workaround for github/safe-settings#955: full-sync.js calls
+      # createProbot() without a logger, so probot.log is null and the run
+      # crashes with "Cannot read properties of null (reading 'info')".
+      # PR #961 fixes this upstream (targets main-enterprise, not yet released);
+      # we inject the same pino logger here until a fixed tag ships.
+      - name: Patch full-sync logger (github/safe-settings#955)
+        working-directory: ${{ env.SAFE_SETTINGS_CODE_DIR }}
+        run: |
+          sed -i \
+            -e "s#const { createProbot } = require('probot')#const { createProbot } = require('probot'); const pino = require('pino')#" \
+            -e "s#const probot = createProbot()#const probot = createProbot({ overrides: { log: pino({ level: process.env.LOG_LEVEL || 'info' }) } })#" \
+            -e "s#if (settings.errors#if (settings \&\& settings.errors#" \
+            full-sync.js
+          echo "--- patched full-sync.js head ---"
+          sed -n '1,12p' full-sync.js
+
       - name: Full sync
         working-directory: ${{ env.SAFE_SETTINGS_CODE_DIR }}
         env:
@@ -53,4 +69,5 @@ jobs:
           ADMIN_REPO: .github
           CONFIG_PATH: .github
           DEPLOYMENT_CONFIG_FILE: ${{ github.workspace }}/deployment-settings.yml
+          LOG_LEVEL: info
         run: npm run full-sync
