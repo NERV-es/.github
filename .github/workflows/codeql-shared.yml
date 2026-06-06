@@ -1,0 +1,22 @@
+name: CodeQL
+
+# Thin caller. Logic lives in NERV-es/.github (SHA-pinned).
+# Shared CodeQL analysis; languages auto-detected (always includes 'actions').
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    - cron: "27 7 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  codeql:
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    uses: NERV-es/.github/.github/workflows/codeql-reusable.yml@d8650513515940879afbf1054d987acab7501cc1
