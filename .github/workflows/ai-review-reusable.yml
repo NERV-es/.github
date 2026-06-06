@@ -12,9 +12,9 @@ on:
         type: string
         default: openai/gpt-4o-mini
       max_diff_bytes:
-        description: Truncate the diff sent to the model
+        description: Truncate the diff sent to the model (gpt-4o-mini caps requests at 8k tokens)
         type: number
-        default: 60000
+        default: 24000
 
 permissions:
   contents: read
@@ -39,7 +39,12 @@ jobs:
 
           diff=$(gh pr diff "$PR" --repo "$REPO" || true)
           if [ -z "$diff" ]; then echo "Empty diff — skipping."; exit 0; fi
+          full_len=$(printf '%s' "$diff" | wc -c | tr -d ' ')
           diff=$(printf '%s' "$diff" | head -c "$MAX_DIFF_BYTES")
+          trunc=""
+          if [ "$full_len" -gt "$MAX_DIFF_BYTES" ]; then
+            trunc="⚠️ Large PR: only the first ${MAX_DIFF_BYTES} of ${full_len} diff bytes were reviewed."
+          fi
 
           title=$(gh pr view "$PR" --repo "$REPO" --json title --jq .title)
 
@@ -80,6 +85,7 @@ jobs:
           {
             echo "## 🤖 AI code review"
             echo
+            [ -n "$trunc" ] && { printf '%s\n' "$trunc"; echo; }
             printf '%s\n' "$review"
             echo
             echo "_Free GitHub Models review (\`$MODEL\`). Advisory only — not a merge gate._"
