@@ -1,94 +1,179 @@
 name: AI Review (reusable)
 
-# Free, in-CI AI code review using GitHub Models (built-in GITHUB_TOKEN,
-# models:read). Read-only: posts a single review comment, never edits code.
-# Skips PRs opened by bots to avoid resolver→review loops.
+# ONE org-wide AI PR reviewer, hosted here in the PUBLIC NERV-es/.github repo so
+# every repo in the org (public or private) can call it with an 8-line stub:
+#
+#   jobs:
+#     ai-review:
+#       uses: NERV-es/.github/.github/workflows/ai-review-reusable.yml@ai-review-v1
+#       secrets: inherit
+#
+# (The doubled `.github/.github/` is correct: the first is the repo named
+#  `.github`, the second is its workflows dir. Pin to the immutable tag.)
+#
+# WHY THIS SHAPE: the org doesn't pay for Copilot. The reviewer (ai_review.py)
+# fans each PR diff out to every LLM whose key is present and posts ONE
+# self-updating, high-signal comment. Cross-model agreement is a strong signal;
+# any provider being down/rate-limited just drops out.
+#
+# ZERO-CONFIG DEFAULT: GitHub Models (free, models:read, built-in token) is
+# always-on provider #1 — a caller needs NO secrets at all. Adding any of the
+# external free-tier keys (Groq/Cerebras/Gemini/OpenRouter/Mistral) via
+# `secrets: inherit` just adds redundancy. Free orgs can't push org-level
+# secrets to private repos, so per-repo secrets + `secrets: inherit` is the
+# correct delivery mechanism.
+#
+# WEBHOOK-OUT: when AGENTGATEWAY_WEBHOOK_URL is set the job ALSO POSTs an
+# HMAC-signed PR payload so the NERV agent fleet can pick up a deep review.
+# Dormant until that secret exists.
 
 on:
   workflow_call:
     inputs:
-      model:
-        description: GitHub Models model id
-        type: string
-        default: openai/gpt-4o-mini
-      max_diff_bytes:
-        description: Truncate the diff sent to the model (gpt-4o-mini caps requests at 8k tokens)
+      max_diff_chars:
+        description: Truncate the diff sent to the models (free tiers have small context windows).
         type: number
-        default: 14000
+        default: 28000
+      reviewer_ref:
+        description: Ref of NERV-es/.github to fetch ai_review.py from (keep in lockstep with the pinned tag).
+        type: string
+        default: ai-review-v1
 
-permissions:
-  contents: read
-  pull-requests: write
-  models: read
+permissions: {}
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
+  # Probe gateway secret presence (can't be read in a job-level `if`). The review
+  # job itself is unconditional — GitHub Models needs no key.
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      gateway: ${{ steps.probe.outputs.gateway }}
+    steps:
+      - name: Probe gateway secret
+        id: probe
+        env:
+          AGENTGATEWAY_WEBHOOK_URL: ${{ secrets.AGENTGATEWAY_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          if [ -n "${AGENTGATEWAY_WEBHOOK_URL}" ]; then
+            echo "gateway=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "gateway=false" >> "$GITHUB_OUTPUT"
+          fi
+
   review:
     if: ${{ github.event.pull_request.user.type != 'Bot' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read # checkout + diff
+      pull-requests: write # post the review comment
+      models: read # free GitHub Models inference
     steps:
-      - name: AI review
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout PR head (for the diff)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch reviewer script from NERV-es/.github
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: NERV-es/.github
+          ref: ${{ inputs.reviewer_ref }}
+          path: .nerv-github
+          persist-credentials: false
+
+      - name: Build PR diff
         env:
-          GH_TOKEN: ${{ github.token }}
-          GH_MODELS_TOKEN: ${{ secrets.MODELS_TOKEN != '' && secrets.MODELS_TOKEN || github.token }}
-          MODEL: ${{ inputs.model }}
-          MAX_DIFF_BYTES: ${{ inputs.max_diff_bytes }}
-          REPO: ${{ github.repository }}
-          PR: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
+          # Exclude vendored/generated/lock noise so the models spend their small
+          # context on code we actually own.
+          git diff --unified=1 "$BASE_SHA"..."$HEAD_SHA" -- . \
+            ':(exclude)**/node_modules/**' \
+            ':(exclude)**/*-lock.json' \
+            ':(exclude)**/package-lock.json' \
+            ':(exclude)**/*.min.*' \
+            ':(exclude).obsidian/**' \
+            ':(exclude).trunk/**' \
+            ':(exclude)**/*.svg' \
+            > /tmp/pr.diff || true
+          echo "diff bytes: $(wc -c < /tmp/pr.diff)"
 
-          diff=$(gh pr diff "$PR" --repo "$REPO" || true)
-          if [ -z "$diff" ]; then echo "Empty diff — skipping."; exit 0; fi
-          full_len=${#diff}
-          diff="${diff:0:$MAX_DIFF_BYTES}"
-          trunc=""
-          if [ "$full_len" -gt "$MAX_DIFF_BYTES" ]; then
-            trunc="⚠️ Large PR: only the first ${MAX_DIFF_BYTES} of ${full_len} diff bytes were reviewed."
+      - name: Multi-LLM review
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          DIFF_FILE: /tmp/pr.diff
+          MAX_DIFF_CHARS: ${{ inputs.max_diff_chars }}
+          # Zero-config default provider — always present (falls back to the
+          # built-in Actions token with models:read).
+          GH_MODELS_TOKEN: ${{ secrets.MODELS_TOKEN != '' && secrets.MODELS_TOKEN || secrets.GITHUB_TOKEN }}
+          # Optional external free-tier providers (add redundancy when set).
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+        run: python3 .nerv-github/.github/scripts/ai_review.py
+
+  # Hand the PR off to the NERV agent fleet for a deep review. Gated on the
+  # webhook URL secret so it stays dormant until the homelab is reachable.
+  webhook-out:
+    needs: guard
+    if: needs.guard.outputs.gateway == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: POST signed PR event to AgentGateway
+        env:
+          WEBHOOK_URL: ${{ secrets.AGENTGATEWAY_WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.AGENTGATEWAY_WEBHOOK_SECRET }}
+          PAYLOAD: >-
+            {"event":"pull_request","action":"${{ github.event.action }}",
+            "repo":"${{ github.repository }}",
+            "number":${{ github.event.pull_request.number }},
+            "title":${{ toJSON(github.event.pull_request.title) }},
+            "url":"${{ github.event.pull_request.html_url }}",
+            "base":"${{ github.event.pull_request.base.sha }}",
+            "head":"${{ github.event.pull_request.head.sha }}",
+            "author":"${{ github.event.pull_request.user.login }}"}
+        run: |
+          set -euo pipefail
+          # HMAC-SHA256 over the body (GitHub's X-Hub-Signature-256 scheme) so
+          # the homelab receiver can verify authenticity before acting.
+          sig="sha256=$(printf '%s' "$PAYLOAD" \
+            | openssl dgst -sha256 -hmac "${WEBHOOK_SECRET:-}" -hex \
+            | awk '{print $NF}')"
+          code=$(curl -sS -o /tmp/resp.txt -w '%{http_code}' \
+            --max-time 20 --retry 2 \
+            -X POST "$WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -H "X-Hub-Signature-256: $sig" \
+            -H 'X-NERV-Event: pull_request' \
+            --data "$PAYLOAD") || true
+          echo "AgentGateway responded HTTP $code"
+          cat /tmp/resp.txt || true
+          # Advisory: never fail the PR if the homelab is momentarily down.
+          if [ "$code" -ge 400 ] || [ "$code" = "000" ]; then
+            echo "::warning::AgentGateway webhook delivery failed (HTTP $code)"
           fi
-
-          title=$(gh pr view "$PR" --repo "$REPO" --json title --jq .title)
-
-          sys='You are a precise, senior code reviewer. Review the unified diff.
-          Output GitHub-flavored markdown only. Be concise and high-signal:
-          flag real bugs, security issues, and logic errors with file:line refs.
-          Skip style nits. If nothing material, say so in one line. Do NOT echo the diff.'
-
-          payload=$(MODEL="$MODEL" SYS="$sys" TITLE="$title" DIFF="$diff" python3 - <<'PY'
-          import json, os
-          print(json.dumps({
-              "model": os.environ["MODEL"],
-              "temperature": 0,
-              "messages": [
-                  {"role": "system", "content": os.environ["SYS"]},
-                  {"role": "user", "content":
-                      "PR title: " + os.environ["TITLE"] + "\n\nUnified diff:\n\n" +
-                      os.environ["DIFF"]},
-              ],
-          }))
-          PY
-          )
-
-          resp=$(curl -sS https://models.github.ai/inference/chat/completions \
-            -H "Authorization: Bearer $GH_MODELS_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "$payload" || true)
-
-          review=$(printf '%s' "$resp" | python3 -c \
-            'import sys,json; d=json.load(sys.stdin); print(d.get("choices",[{}])[0].get("message",{}).get("content","") or "")' \
-            2>/dev/null || true)
-
-          if [ -z "$review" ]; then
-            echo "No review content (model error or rate limit). Response:"; echo "$resp" | head -c 800
-            exit 0
-          fi
-
-          {
-            echo "## 🤖 AI code review"
-            echo
-            [ -n "$trunc" ] && { printf '%s\n' "$trunc"; echo; }
-            printf '%s\n' "$review"
-            echo
-            echo "_Free GitHub Models review (\`$MODEL\`). Advisory only — not a merge gate._"
-          } > review.md
-
-          gh pr comment "$PR" --repo "$REPO" --body-file review.md

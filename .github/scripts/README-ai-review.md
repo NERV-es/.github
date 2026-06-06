@@ -1,0 +1,75 @@
+# Org AI PR reviewer (free-tier, multi-LLM)
+
+`ai_review.py` + `.github/workflows/ai-review-reusable.yml` give every repo in the
+org a high-signal AI code review on each PR **without paying for Copilot**. One
+definition lives here in the public `NERV-es/.github` repo; each repo opts in with
+an 8-line stub:
+
+```yaml
+# .github/workflows/ai-review.yml in any repo
+name: ai-review
+on:
+  pull_request:
+permissions: {}
+jobs:
+  ai-review:
+    uses: NERV-es/.github/.github/workflows/ai-review-reusable.yml@ai-review-v1
+    secrets: inherit
+```
+
+The reusable checks out the caller (for the diff) **and** this repo at the pinned
+tag (for `ai_review.py`), then posts one consolidated, self-updating comment via
+the `<!-- nerv-ai-review -->` marker (PATCH if present, else POST).
+
+## Providers
+
+`ai_review.py` fans the diff out to every provider whose key is in the env and
+merges the results. All are OpenAI-compatible `/chat/completions` (Bearer auth);
+each call is isolated so one provider failing never blocks the others.
+
+| Provider | Secret name | Model | Key needed? |
+| --- | --- | --- | --- |
+| **GitHub Models** | *(built-in token)* | openai/gpt-4o-mini | **No** — zero-config default |
+| Groq | `GROQ_API_KEY` | llama-3.3-70b-versatile | optional |
+| Cerebras | `CEREBRAS_API_KEY` | gpt-oss-120b | optional |
+| Google Gemini | `GEMINI_API_KEY` | gemini-2.0-flash | optional |
+| OpenRouter | `OPENROUTER_API_KEY` | llama-3.3-70b-instruct (`:free`) | optional |
+| Mistral | `MISTRAL_API_KEY` | codestral-latest | optional |
+
+**GitHub Models is always on** — the reusable sets `GH_MODELS_TOKEN` to the
+built-in `GITHUB_TOKEN` (with `models: read`), so a repo needs **no secrets at
+all** to get reviews. Adding any external free-tier key (set per-repo via
+`gh secret set <NAME> --repo NERV-es/<repo>`; org-level secrets don't reach
+private repos on the free plan, hence `secrets: inherit`) just adds redundant
+cross-model coverage.
+
+Free-tier gotchas baked into the script: Groq/Cerebras 403 (Cloudflare err 1010)
+the default urllib User-Agent → a normal UA header is sent; Cerebras free models
+are `gpt-oss-120b`/`zai-glm-4.7` (no llama); Groq free tier is ~12k TPM, so the
+diff is capped (`max_diff_chars`, default 28000); OpenRouter `:free` models often
+429 upstream — handled gracefully.
+
+## Optional: webhook out to the homelab
+
+When `AGENTGATEWAY_WEBHOOK_URL` is set the reusable's `webhook-out` job also POSTs
+an HMAC-SHA256-signed (`X-Hub-Signature-256`) PR payload so the NERV agent fleet
+can pick up a deep review. Advisory — never fails the PR. Dormant until the
+homelab is reachable from GitHub-hosted runners (cloudflared / tailscale funnel).
+
+```bash
+gh secret set AGENTGATEWAY_WEBHOOK_URL    --repo NERV-es/<repo>  # https tunnel URL
+gh secret set AGENTGATEWAY_WEBHOOK_SECRET --repo NERV-es/<repo>  # shared HMAC secret
+```
+
+Receiver side lives in the NERV repo: `scripts/github-webhook-receiver.py`
+(stdlib-only) verifies the HMAC with `NERV_WEBHOOK_SECRET`
+(== `AGENTGATEWAY_WEBHOOK_SECRET`) and enqueues a `task.discover` on the
+agent-bus (spools to disk if the bus is down). Manifest:
+`services/github-webhook-receiver.json`.
+
+## Cutting a new version
+
+`ai-review-reusable.yml` checks out this repo at `reviewer_ref` (default
+`ai-review-v1`) to fetch the script, so the tag and the file stay in lockstep.
+After changing the script or workflow, move/recreate the tag (or bump to
+`ai-review-v2` and update the stubs).
