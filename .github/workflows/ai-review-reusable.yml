@@ -146,11 +146,13 @@ jobs:
       - name: Generate app token (bobby-claws)
         id: app-token
         # The App creds are ORG secrets, which a FREE org does NOT expose to
-        # PRIVATE repos (same limit as the provider keys). So this step is gated
-        # on the secret being visible; when it isn't (e.g. on private NERV-es/NERV
-        # via the self-hosted runner) we fall back to the built-in GITHUB_TOKEN
-        # below and post as github-actions[bot] instead of bobby-claws.
-        if: ${{ secrets.NERV_APP_ID != '' && secrets.NERV_APP_PRIVATE_KEY != '' }}
+        # PRIVATE repos (same limit as the provider keys). On private NERV-es/NERV
+        # (now on the self-hosted runner) this step therefore can't mint a token;
+        # continue-on-error lets the job proceed and fall back to the built-in
+        # GITHUB_TOKEN below (posts as github-actions[bot] instead of bobby-claws).
+        # NOTE: `secrets` can't be used in a step `if:`, so we tolerate the failure
+        # rather than gate on it.
+        continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.NERV_APP_ID }}
