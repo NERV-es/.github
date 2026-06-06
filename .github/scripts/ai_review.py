@@ -78,6 +78,28 @@ PROVIDERS = [
         "url": "https://api.mistral.ai/v1/chat/completions",
         "model": "codestral-latest",
     },
+    {
+        "name": "NVIDIA NIM · llama-3.3-70b",
+        "env": "NVIDIA_API_KEY",
+        "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "model": "meta/llama-3.3-70b-instruct",
+    },
+    {
+        "name": "Cohere · command-r-plus",
+        "env": "COHERE_API_KEY",
+        "url": "https://api.cohere.ai/compatibility/v1/chat/completions",
+        "model": "command-r-plus-08-2024",
+    },
+    {
+        # Workers AI's OpenAI-compatible endpoint needs the account id in the
+        # path. `url_account_env` keeps this provider dormant unless BOTH
+        # CLOUDFLARE_API_KEY and CLOUDFLARE_ACCOUNT_ID are set.
+        "name": "Cloudflare Workers AI · llama-3.3-70b",
+        "env": "CLOUDFLARE_API_KEY",
+        "url": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions",
+        "model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        "url_account_env": "CLOUDFLARE_ACCOUNT_ID",
+    },
 ]
 
 SYSTEM_PROMPT = (
@@ -102,6 +124,15 @@ def review_with(provider: dict, diff: str) -> str:
     key = os.environ.get(provider["env"], "").strip()
     if not key:
         return ""
+    url = provider["url"]
+    # Providers whose endpoint embeds an account id (e.g. Cloudflare Workers AI)
+    # stay dormant until that id is supplied.
+    acct_env = provider.get("url_account_env")
+    if acct_env:
+        acct = os.environ.get(acct_env, "").strip()
+        if not acct:
+            return ""
+        url = url.format(account_id=acct)
     headers = {
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
@@ -122,7 +153,7 @@ def review_with(provider: dict, diff: str) -> str:
         ],
     }
     try:
-        body = http_post_json(provider["url"], headers, payload, HTTP_TIMEOUT)
+        body = http_post_json(url, headers, payload, HTTP_TIMEOUT)
         choices = body.get("choices") or []
         if not choices:
             return f"_provider error: no choices in response — {str(body)[:200]}_"
@@ -199,7 +230,16 @@ def main() -> int:
         diff = diff[:max_diff_chars]
 
     sections: list[str] = []
-    active = [p for p in PROVIDERS if os.environ.get(p["env"], "").strip()]
+
+    def _enabled(p: dict) -> bool:
+        if not os.environ.get(p["env"], "").strip():
+            return False
+        acct_env = p.get("url_account_env")
+        if acct_env and not os.environ.get(acct_env, "").strip():
+            return False
+        return True
+
+    active = [p for p in PROVIDERS if _enabled(p)]
     if not active:
         print("No provider API keys present — skipping.")
         return 0

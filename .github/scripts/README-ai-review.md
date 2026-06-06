@@ -35,6 +35,9 @@ each call is isolated so one provider failing never blocks the others.
 | Google Gemini | `GEMINI_API_KEY` | gemini-2.0-flash | optional |
 | OpenRouter | `OPENROUTER_API_KEY` | llama-3.3-70b-instruct (`:free`) | optional |
 | Mistral | `MISTRAL_API_KEY` | codestral-latest | optional |
+| NVIDIA NIM | `NVIDIA_API_KEY` | meta/llama-3.3-70b-instruct | optional |
+| Cohere | `COHERE_API_KEY` | command-r-plus-08-2024 | optional |
+| Cloudflare Workers AI | `CLOUDFLARE_API_KEY` **+** `CLOUDFLARE_ACCOUNT_ID` | @cf/meta/llama-3.3-70b-instruct-fp8-fast | optional (needs both) |
 
 **GitHub Models is always on** — the reusable sets `GH_MODELS_TOKEN` to the
 built-in `GITHUB_TOKEN` (with `models: read`), so a repo needs **no secrets at
@@ -43,11 +46,17 @@ all** to get reviews. Adding any external free-tier key (set per-repo via
 private repos on the free plan, hence `secrets: inherit`) just adds redundant
 cross-model coverage.
 
+**Cloudflare Workers AI** is special: its OpenAI-compatible endpoint embeds the
+account id in the URL, so it needs **both** `CLOUDFLARE_API_KEY` **and**
+`CLOUDFLARE_ACCOUNT_ID` (the 32-hex id from your Cloudflare dashboard URL /
+right sidebar). The provider auto-skips until both are present.
+
 Free-tier gotchas baked into the script: Groq/Cerebras 403 (Cloudflare err 1010)
 the default urllib User-Agent → a normal UA header is sent; Cerebras free models
 are `gpt-oss-120b`/`zai-glm-4.7` (no llama); Groq free tier is ~12k TPM, so the
 diff is capped (`max_diff_chars`, default 28000); OpenRouter `:free` models often
-429 upstream — handled gracefully.
+429 upstream — handled gracefully. NVIDIA NIM, Cohere (`/compatibility/v1`), and
+Cloudflare Workers AI are all OpenAI-compatible and validated live.
 
 ## Optional: webhook out to the homelab
 
