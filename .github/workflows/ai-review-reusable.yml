@@ -236,6 +236,7 @@ jobs:
           PR_NUMBER: ${{ steps.ctx.outputs.pr_number }}
           HEAD_SHA: ${{ steps.ctx.outputs.head_sha }}
           DIFF_FILE: /tmp/pr.diff
+          TRANSCRIPT_FILE: /tmp/ai-review.md
           # Event + command context (drives the /bobby on-demand re-review path).
           EVENT_NAME: ${{ github.event_name }}
           COMMENT_BODY: ${{ github.event.comment.body }}
@@ -272,6 +273,20 @@ jobs:
           CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: python3 .nerv-github/.github/scripts/ai_review.py
+
+      # Keep the diff the model saw + the final review as a small artifact, for
+      # debugging the reviewer. Best-effort; retention follows the repo default.
+      - name: Upload review transcript
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ai-review-transcript-${{ steps.ctx.outputs.pr_number }}-${{ github.run_id }}
+          path: |
+            /tmp/pr.diff
+            /tmp/ai-review.md
+          if-no-files-found: ignore
+          retention-days: 14
 
   # Hand the PR off to the NERV agent fleet for a deep review. Gated on the
   # webhook URL secret so it stays dormant until the homelab is reachable.

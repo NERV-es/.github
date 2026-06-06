@@ -1205,6 +1205,16 @@ def main() -> int:
     if summary:
         with open(summary, "a", encoding="utf-8") as fh:
             fh.write(body + "\n")
+
+    # Persist the final review to a transcript file so the workflow can keep it
+    # (plus the diff) as a downloadable artifact for debugging the reviewer.
+    transcript = os.environ.get("TRANSCRIPT_FILE")
+    if transcript:
+        try:
+            with open(transcript, "w", encoding="utf-8") as fh:
+                fh.write(body + "\n")
+        except Exception as e:  # noqa: BLE001
+            print(f"Could not write transcript (ignored): {e}")
     return 0
 
 
