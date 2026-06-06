@@ -11,3 +11,5 @@ def read_file(path):
 
 def hash_pw(pw):
     return hashlib.md5(pw.encode()).hexdigest()
+
+# touch to re-trigger review with fixed reusable
