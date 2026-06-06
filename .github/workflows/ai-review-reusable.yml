@@ -14,7 +14,7 @@ on:
       max_diff_bytes:
         description: Truncate the diff sent to the model (gpt-4o-mini caps requests at 8k tokens)
         type: number
-        default: 24000
+        default: 14000
 
 permissions:
   contents: read
