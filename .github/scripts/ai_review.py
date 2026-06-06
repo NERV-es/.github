@@ -38,11 +38,37 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # Marker so we can find + update our own comment instead of spamming a new one
 # on every push to the PR branch.
 MARKER = "<!-- nerv-ai-review -->"
+# Hidden markers on the inline review comments and the review "event" (approve /
+# comment) so we can find + replace OUR OWN ones on the next run without needing
+# to know the App's bot login. Identity-agnostic and spam-proof.
+LINE_MARKER = "<!-- nerv-ai-line -->"
+REVIEW_MARKER = "<!-- nerv-ai-review-event -->"
+
+# Severity model used for inline comments, the PR badge, and the auto-label.
+SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+SEVERITY_EMOJI = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵",
+                  "clean": "✅", "reviewed": "📝"}
+# label name, hex colour, description. `reviewed` = posted but unclassified;
+# `clean` = no blocking issues (the auto-approve case).
+SEV_LABELS = {
+    "critical": ("ai-review:critical", "b60205", "AI review: critical issue"),
+    "high": ("ai-review:high", "d93f0b", "AI review: high-severity issue"),
+    "medium": ("ai-review:medium", "fbca04", "AI review: medium-severity issue"),
+    "low": ("ai-review:low", "0e8a16", "AI review: low-severity issue"),
+    "reviewed": ("ai-review:reviewed", "ededed", "AI review posted (unclassified)"),
+    "clean": ("ai-review:clean", "0e8a16", "AI review: no blocking issues"),
+}
+ALL_SEV_LABELS = [v[0] for v in SEV_LABELS.values()]
+# Bounds so a noisy model can't spray hundreds of inline threads or blow the
+# extraction call's context.
+MAX_INLINE_COMMENTS = 25
+EXTRACT_DIFF_BUDGET = 12_000
 
 # Diffs are capped before the model call: free tiers have small context windows
 # and we'd rather review the first ~48k chars well than overflow and get junk.
@@ -351,6 +377,359 @@ def upsert_comment(repo: str, pr: str, token: str, body: str) -> None:
         print("Posted new review comment.")
 
 
+def post_issue_comment(repo: str, pr: str, token: str, body: str) -> None:
+    """Plain (non-idempotent) issue comment — used for /bobby command replies."""
+    gh_api("POST", f"https://api.github.com/repos/{repo}/issues/{pr}/comments", token, {"body": body})
+
+
+def add_reaction(repo: str, comment_id: str, token: str, content: str) -> None:
+    """Best-effort emoji reaction on a comment (UX ack for /bobby commands)."""
+    if not comment_id:
+        return
+    try:
+        gh_api("POST",
+               f"https://api.github.com/repos/{repo}/issues/comments/{comment_id}/reactions",
+               token, {"content": content})
+    except Exception as e:  # noqa: BLE001 — purely cosmetic
+        print(f"  reaction '{content}' failed (ignored): {e}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Inline comments, severity labels, and the approve/comment review event.
+# ---------------------------------------------------------------------------
+
+def build_line_index(diff: str) -> dict[str, set[int]]:
+    """Map each file -> the set of NEW-file line numbers that are ADDED (`+`)
+    lines in the diff. Those are the only positions GitHub accepts a RIGHT-side
+    inline review comment on, so we use this to validate (and snap) the model's
+    cited line numbers before posting — an out-of-range line 422s the whole
+    review."""
+    idx: dict[str, set[int]] = {}
+    path: str | None = None
+    in_hunk = False
+    cur = 0
+    hunk_re = re.compile(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            p = line[4:].strip()
+            if p == "/dev/null":
+                path = None
+            else:
+                path = p[2:] if p.startswith("b/") else p
+                idx.setdefault(path, set())
+            in_hunk = False
+        elif line.startswith("@@"):
+            m = hunk_re.search(line)
+            cur = int(m.group(1)) if m else 0
+            in_hunk = True
+        elif in_hunk and path is not None:
+            if line.startswith("+"):
+                idx[path].add(cur)
+                cur += 1
+            elif line.startswith("-"):
+                pass  # left side only — new-file counter unchanged
+            elif line.startswith("\\"):
+                pass  # "\ No newline at end of file"
+            else:
+                cur += 1  # context line advances the new-file counter
+    return idx
+
+
+EXTRACT_SYSTEM_PROMPT = (
+    "You convert a prose code review into STRICT JSON for inline PR comments. "
+    "Output ONLY a JSON array (no prose, no markdown fences). Each element is "
+    '{"file": "<path from the diff>", "line": <integer NEW-file line number of an '
+    'added (+) line>, "severity": "critical|high|medium|low", "comment": "<one '
+    'concise sentence>"}. Use only issues already present in the review notes; do '
+    "NOT invent new ones. Pick the most relevant added line for each issue. If "
+    "there are no real, blocking issues, output exactly []."
+)
+
+
+def _parse_json_array(text: str) -> list:
+    """Pull the first JSON array out of a model response, tolerating code fences
+    or stray prose around it."""
+    if not text:
+        return []
+    t = text.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\n?", "", t)
+        t = re.sub(r"\n?```$", "", t).strip()
+    try:
+        v = json.loads(t)
+        return v if isinstance(v, list) else []
+    except Exception:  # noqa: BLE001
+        pass
+    start = t.find("[")
+    end = t.rfind("]")
+    if start != -1 and end > start:
+        try:
+            v = json.loads(t[start:end + 1])
+            return v if isinstance(v, list) else []
+        except Exception:  # noqa: BLE001
+            return []
+    return []
+
+
+def extract_findings(active: list[dict], review_text: str, diff: str) -> list[dict]:
+    """Second, cheap pass: turn the final prose review into structured findings
+    (file/line/severity/comment) for inline comments + the severity label. Uses
+    the same fallback chain (medium budgets first, like synthesis — the input is
+    small). Best-effort: returns [] if every provider fails or nothing parses."""
+    excerpt = diff[:EXTRACT_DIFF_BUDGET]
+    user = (
+        "Diff under review:\n```diff\n" + excerpt + "\n```\n\n"
+        "Review notes to convert into JSON findings:\n" + review_text
+    )
+    medium = [p for p in active if SYNTH_MEDIUM_LO <= p.get("max_chars", 0) <= SYNTH_MEDIUM_HI]
+    order = medium + [p for p in active if p not in medium]
+    for p in order:
+        out = _chat(p, [
+            {"role": "system", "content": EXTRACT_SYSTEM_PROMPT},
+            {"role": "user", "content": user},
+        ], max_tokens=1400)
+        if out is None:
+            continue
+        raw = _parse_json_array(out)
+        findings: list[dict] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            f = str(item.get("file", "")).strip().lstrip("ab/").strip()
+            sev = str(item.get("severity", "")).strip().lower()
+            comment = str(item.get("comment", "")).strip()
+            try:
+                ln = int(item.get("line"))
+            except (TypeError, ValueError):
+                continue
+            if f and comment and ln > 0 and sev in SEVERITY_ORDER:
+                findings.append({"file": f, "line": ln, "severity": sev, "comment": comment})
+        print(f"Findings extraction via {p['name']}: {len(findings)} item(s).")
+        return findings[:50]
+    print("Findings extraction: no provider available.")
+    return []
+
+
+def _snap_line(line: int, added: set[int]) -> int | None:
+    """Return `line` if it's an added line, else the nearest added line within a
+    small window (models are often off by a row or two), else None."""
+    if line in added:
+        return line
+    if not added:
+        return None
+    nearest = min(added, key=lambda x: abs(x - line))
+    return nearest if abs(nearest - line) <= 3 else None
+
+
+def map_inline_comments(findings: list[dict], idx: dict[str, set[int]]) -> tuple[list[dict], list[dict]]:
+    """Turn findings into GitHub review-comment payloads anchored to valid diff
+    lines. Findings whose file/line can't be resolved are returned as `unmapped`
+    (they still live in the prose summary). Deduped by (file, line); capped."""
+    inline: list[dict] = []
+    unmapped: list[dict] = []
+    seen: set[tuple[str, int]] = set()
+    # Critical/high first so the cap keeps the scariest findings.
+    for f in sorted(findings, key=lambda x: -SEVERITY_ORDER.get(x["severity"], 0)):
+        # Match the finding's path against the diff's paths (suffix-tolerant).
+        added = idx.get(f["file"])
+        if added is None:
+            match = [p for p in idx if p.endswith(f["file"]) or f["file"].endswith(p)]
+            added = idx[match[0]] if len(match) == 1 else None
+            path = match[0] if len(match) == 1 else f["file"]
+        else:
+            path = f["file"]
+        target = _snap_line(f["line"], added) if added else None
+        if target is None or (path, target) in seen:
+            if (path, target) not in seen:
+                unmapped.append(f)
+            continue
+        seen.add((path, target))
+        emoji = SEVERITY_EMOJI.get(f["severity"], "")
+        body = f"{emoji} **{f['severity']}** — {f['comment']}\n{LINE_MARKER}"
+        inline.append({"path": path, "line": target, "side": "RIGHT", "body": body})
+        if len(inline) >= MAX_INLINE_COMMENTS:
+            break
+    return inline, unmapped
+
+
+def max_severity(findings: list[dict]) -> str | None:
+    if not findings:
+        return None
+    return max(findings, key=lambda f: SEVERITY_ORDER.get(f["severity"], 0))["severity"]
+
+
+def ensure_label(repo: str, token: str, name: str, color: str, desc: str) -> None:
+    """Create the label if it doesn't exist yet (idempotent, best-effort)."""
+    enc = urllib.parse.quote(name, safe="")
+    try:
+        gh_api("GET", f"https://api.github.com/repos/{repo}/labels/{enc}", token)
+        return
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            return
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        gh_api("POST", f"https://api.github.com/repos/{repo}/labels", token,
+               {"name": name, "color": color, "description": desc})
+    except Exception as e:  # noqa: BLE001
+        print(f"  label create '{name}' failed (ignored): {e}", flush=True)
+
+
+def set_severity_label(repo: str, pr: str, token: str, severity: str) -> None:
+    """Apply the single ai-review:<severity> label, removing any other one we
+    previously set so the PR reflects only the latest verdict."""
+    name, color, desc = SEV_LABELS[severity]
+    ensure_label(repo, token, name, color, desc)
+    try:
+        current = gh_api("GET", f"https://api.github.com/repos/{repo}/issues/{pr}/labels", token)
+    except Exception as e:  # noqa: BLE001
+        current = []
+        print(f"  could not list PR labels (ignored): {e}", flush=True)
+    for lbl in current:
+        ln = lbl.get("name", "")
+        if ln in ALL_SEV_LABELS and ln != name:
+            try:
+                gh_api("DELETE",
+                       f"https://api.github.com/repos/{repo}/issues/{pr}/labels/{urllib.parse.quote(ln, safe='')}",
+                       token)
+            except Exception:  # noqa: BLE001
+                pass
+    try:
+        gh_api("POST", f"https://api.github.com/repos/{repo}/issues/{pr}/labels", token, {"labels": [name]})
+        print(f"Applied label {name}.")
+    except Exception as e:  # noqa: BLE001
+        print(f"  label apply '{name}' failed (ignored): {e}", flush=True)
+
+
+def delete_prior_line_comments(repo: str, pr: str, token: str) -> None:
+    """Remove OUR previous inline review comments (by hidden marker) so a new run
+    replaces them instead of stacking duplicate threads on every push."""
+    try:
+        comments = gh_api("GET",
+                          f"https://api.github.com/repos/{repo}/pulls/{pr}/comments?per_page=100", token)
+    except Exception as e:  # noqa: BLE001
+        print(f"  could not list review comments (ignored): {e}", flush=True)
+        return
+    n = 0
+    for c in comments:
+        if LINE_MARKER in (c.get("body") or ""):
+            try:
+                gh_api("DELETE", f"https://api.github.com/repos/{repo}/pulls/comments/{c['id']}", token)
+                n += 1
+            except Exception:  # noqa: BLE001
+                pass
+    if n:
+        print(f"Cleared {n} stale inline comment(s).")
+
+
+def dismiss_prior_approvals(repo: str, pr: str, token: str, message: str) -> None:
+    """Dismiss OUR earlier APPROVE review (by hidden marker) when a later push
+    surfaces issues, so a stale 'approved' state doesn't linger."""
+    try:
+        reviews = gh_api("GET",
+                        f"https://api.github.com/repos/{repo}/pulls/{pr}/reviews?per_page=100", token)
+    except Exception as e:  # noqa: BLE001
+        print(f"  could not list reviews (ignored): {e}", flush=True)
+        return
+    for r in reviews:
+        if r.get("state") == "APPROVED" and REVIEW_MARKER in (r.get("body") or ""):
+            try:
+                gh_api("PUT",
+                       f"https://api.github.com/repos/{repo}/pulls/{pr}/reviews/{r['id']}/dismissals",
+                       token, {"message": message, "event": "DISMISS"})
+                print(f"Dismissed stale approval {r['id']}.")
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def submit_review(repo: str, pr: str, token: str, commit_id: str,
+                  body: str, inline_comments: list[dict], event: str) -> None:
+    """Submit ONE PR review carrying the inline comments + the APPROVE/COMMENT
+    event. Falls back gracefully on a 422 (e.g. can't approve own PR, or a line
+    slipped past validation) so we never hard-fail the job over a review."""
+    payload: dict = {"event": event, "body": body + "\n" + REVIEW_MARKER}
+    if inline_comments:
+        payload["comments"] = inline_comments
+    if commit_id:
+        payload["commit_id"] = commit_id
+    url = f"https://api.github.com/repos/{repo}/pulls/{pr}/reviews"
+    try:
+        gh_api("POST", url, token, payload)
+        print(f"Submitted {event} review with {len(inline_comments)} inline comment(s).")
+        return
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:200]
+        except Exception:  # noqa: BLE001
+            pass
+        print(f"  review submit HTTP {e.code} — {detail}; retrying degraded.", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"  review submit failed: {e}; retrying degraded.", flush=True)
+    # Degraded retry: drop the event to COMMENT and drop inline comments (a bad
+    # line is the most common 422), so at least the event posts.
+    try:
+        gh_api("POST", url, token, {"event": "COMMENT", "body": body + "\n" + REVIEW_MARKER})
+        print("Submitted degraded COMMENT review (no inline comments).")
+    except Exception as e:  # noqa: BLE001
+        print(f"  degraded review submit also failed (ignored): {e}", flush=True)
+
+
+def looks_clean(text: str) -> bool:
+    """True when the review prose says there's nothing blocking."""
+    m = (text or "").strip().lower()
+    return m.startswith("no blocking") or ("no blocking issue" in m[:160])
+
+
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def inject_badge(body: str, severity: str, n_inline: int, approved: bool) -> str:
+    """Insert a one-line severity/inline/approve badge right under the AI-review
+    heading of the summary comment."""
+    emoji = SEVERITY_EMOJI.get(severity, "")
+    bits = [f"{emoji} **Severity: {severity}**"]
+    if n_inline:
+        bits.append(f"💬 {n_inline} inline comment(s)")
+    if approved:
+        bits.append("✅ advisory approval")
+    badge = " · ".join(bits)
+    return re.sub(r"(\n## [^\n]*\n)", r"\1\n" + badge + "\n", body, count=1)
+
+
+def parse_command(body: str, prefix: str) -> str:
+    """Classify a /bobby command. Defaults to 're-review' when only the prefix is
+    given (e.g. a bare '/bobby')."""
+    rest = (body or "").strip()
+    if rest.lower().startswith(prefix.lower()):
+        rest = rest[len(prefix):].strip()
+    word = rest.split()[0].lower() if rest.split() else "review"
+    if word in ("review", "re-review", "rereview", "again", "go", "recheck"):
+        return "review"
+    if word in ("help", "?", "usage", "commands"):
+        return "help"
+    return "unknown"
+
+
+HELP_TEXT = (
+    f"{MARKER}\n"
+    "### 🤖 bobby-claws — commands\n\n"
+    "| command | what it does |\n"
+    "| --- | --- |\n"
+    "| `/bobby review` | Re-run the AI review on the latest commit |\n"
+    "| `/bobby re-review` | Alias of `/bobby review` |\n"
+    "| `/bobby help` | Show this help |\n\n"
+    "_Every push is reviewed automatically too. The review is **advisory** — it "
+    "posts inline comments, a severity label, and approves the PR when it finds "
+    "nothing blocking. Free-tier models, multi-provider fallback._"
+)
+
+
 _HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
 
 
@@ -571,6 +950,26 @@ def main() -> int:
     pr = os.environ["PR_NUMBER"]
     diff_file = os.environ["DIFF_FILE"]
 
+    # Event context: a `pull_request` push (automatic) or an `issue_comment`
+    # carrying a /bobby command. Commands get an early eyes-reaction ack; help /
+    # unknown short-circuit before we spend a model call.
+    event_name = os.environ.get("EVENT_NAME", "pull_request").strip()
+    command_prefix = os.environ.get("COMMAND_PREFIX", "/bobby").strip() or "/bobby"
+    comment_id = os.environ.get("COMMENT_ID", "").strip()
+    if event_name == "issue_comment":
+        cmd = parse_command(os.environ.get("COMMENT_BODY", ""), command_prefix)
+        add_reaction(repo, comment_id, token, "eyes")
+        if cmd == "help":
+            post_issue_comment(repo, pr, token, HELP_TEXT)
+            print("Posted /bobby help.")
+            return 0
+        if cmd == "unknown":
+            post_issue_comment(repo, pr, token,
+                               f"{MARKER}\nUnknown command. Try `{command_prefix} help`.")
+            print("Posted unknown-command reply.")
+            return 0
+        print(f"/bobby {cmd}: re-running review on demand.")
+
     max_diff_chars = MAX_DIFF_CHARS
     if os.environ.get("MAX_DIFF_CHARS", "").strip().isdigit():
         max_diff_chars = int(os.environ["MAX_DIFF_CHARS"])
@@ -680,6 +1079,7 @@ def main() -> int:
                 merged_by = None
 
         if merged and merged_by:
+            review_text = merged
             details = "\n\n".join(sections)
             body = (
                 f"{MARKER}\n"
@@ -695,6 +1095,7 @@ def main() -> int:
                 + "\n\n</details>"
             )
         else:
+            review_text = "\n\n".join(r["review"] for r in results if r["review"])
             body = (
                 f"{MARKER}\n"
                 "## 🤖 AI review (chunked)\n"
@@ -710,6 +1111,7 @@ def main() -> int:
         if not review or chosen is None:
             print("All providers in the chain were unavailable — no review posted.")
             return 0
+        review_text = review
         truncated = len(diff) > chosen_budget
         notes = []
         if tried:
@@ -726,7 +1128,78 @@ def main() -> int:
         )
         body = f"{MARKER}\n## 🤖 AI review\n\n" + review + footer
 
+    # ----- structured findings -> badge, inline comments, label, approval -----
+    # A second cheap pass turns the prose review into machine-readable findings,
+    # which drive: (1) a severity badge on the summary, (2) inline review
+    # comments anchored to the diff, (3) an ai-review:<severity> label, and
+    # (4) an advisory APPROVE when nothing's blocking. All best-effort and
+    # individually toggleable; none may break the core comment above.
+    inline_on = env_bool("INLINE_COMMENTS", True)
+    labels_on = env_bool("SEVERITY_LABELS", True)
+    approve_on = env_bool("APPROVE_WHEN_CLEAN", True)
+    head_sha = os.environ.get("HEAD_SHA", "").strip()
+
+    clean = looks_clean(review_text)
+    findings: list[dict] = []
+    if (inline_on or labels_on) and not clean:
+        try:
+            findings = extract_findings(active, review_text, diff)
+        except Exception as e:  # noqa: BLE001 — never block the review
+            print(f"Findings extraction failed (continuing): {e}")
+
+    if clean:
+        severity = "clean"
+    elif findings:
+        severity = max_severity(findings) or "reviewed"
+    else:
+        severity = "reviewed"
+
+    inline_comments: list[dict] = []
+    if inline_on and findings:
+        line_index = build_line_index(diff)
+        inline_comments, unmapped = map_inline_comments(findings, line_index)
+        if unmapped:
+            print(f"{len(unmapped)} finding(s) couldn't be anchored to a diff line "
+                  "(kept in the summary only).")
+
+    approved = approve_on and clean
+    body = inject_badge(body, severity, len(inline_comments), approved)
     upsert_comment(repo, pr, token, body)
+
+    if labels_on:
+        try:
+            set_severity_label(repo, pr, token, severity)
+        except Exception as e:  # noqa: BLE001
+            print(f"Severity label failed (ignored): {e}")
+
+    # Inline comments + the approve/comment event ride on ONE PR review. We only
+    # submit when there's something to add (inline notes or an approval) so we
+    # don't spam empty reviews on every push.
+    if inline_on or approve_on:
+        try:
+            delete_prior_line_comments(repo, pr, token)
+            if approved:
+                submit_review(repo, pr, token, head_sha,
+                              "✅ No blocking issues found — advisory approval by bobby-claws. "
+                              "See the summary comment for context.",
+                              [], "APPROVE")
+            elif inline_comments:
+                dismiss_prior_approvals(repo, pr, token,
+                                        "New changes surfaced issues — re-reviewing.")
+                submit_review(repo, pr, token, head_sha,
+                              f"💬 {len(inline_comments)} inline note(s) below — advisory only. "
+                              "Full write-up in the summary comment.",
+                              inline_comments, "COMMENT")
+            else:
+                # Issues exist but none anchored to a diff line: drop a stale
+                # approval if there was one, but don't post an empty review.
+                dismiss_prior_approvals(repo, pr, token,
+                                        "New changes surfaced issues — re-reviewing.")
+        except Exception as e:  # noqa: BLE001
+            print(f"Inline/approval review failed (ignored): {e}")
+
+    if event_name == "issue_comment" and comment_id:
+        add_reaction(repo, comment_id, token, "rocket")
 
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
