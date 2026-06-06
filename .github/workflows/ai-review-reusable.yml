@@ -78,15 +78,19 @@ on:
 permissions: {}
 
 concurrency:
-  # PR number comes from a different place per event (pull_request vs the
-  # issue_comment that carries a /bobby command); coalesce both.
-  group: ai-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  # Scope the group by event (and the comment id for /bobby commands) so that:
+  #   * successive pushes to a PR supersede each other (pull_request group), but
+  #   * an unrelated bot comment's issue_comment run can NEVER cancel the actual
+  #     PR review — each comment gets its own unique group.
+  group: ai-review-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.event_name }}${{ github.event.comment.id || '' }}
   cancel-in-progress: true
 
 jobs:
-  # Probe gateway secret presence (can't be read in a job-level `if`). The review
-  # job itself is unconditional — GitHub Models needs no key.
+  # Probe gateway secret presence (can't be read in a job-level `if`). Only the
+  # webhook-out path needs it, so it's pull_request-only — a /bobby comment
+  # (issue_comment) shouldn't spin up any job except the review itself.
   guard:
+    if: ${{ github.event_name == 'pull_request' }}
     runs-on: ${{ inputs.runs_on }}
     outputs:
       gateway: ${{ steps.probe.outputs.gateway }}
