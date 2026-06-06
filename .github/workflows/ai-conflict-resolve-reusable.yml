@@ -42,7 +42,7 @@ jobs:
 
       - name: Resolve conflicts into a draft PR
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.MODELS_TOKEN != '' && secrets.MODELS_TOKEN || github.token }}
           GH_MODELS_TOKEN: ${{ secrets.MODELS_TOKEN != '' && secrets.MODELS_TOKEN || github.token }}
           MODEL: ${{ inputs.model }}
           REPO: ${{ github.repository }}
@@ -84,7 +84,10 @@ jobs:
           rm -rf .ci
           git add -A && git commit -m "chore: drop resolver scratch" --no-edit || true
 
-          git push --force-with-lease origin "$SYNC_BRANCH"
+          # Push via the token directly so workflow-file changes are allowed
+          # (the default Actions app lacks `workflows` push permission).
+          git push --force-with-lease \
+            "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$SYNC_BRANCH"
 
           body_file=ai_resolve_summary.md
           [ -f "$body_file" ] || echo "Clean upstream sync (no conflicts)." > "$body_file"
