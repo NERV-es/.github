@@ -54,6 +54,10 @@ on:
         description: Ref of NERV-es/.github to fetch ai_review.py from (keep in lockstep with the pinned tag).
         type: string
         default: ai-review-v1
+      runs_on:
+        description: Runner label for every job. Default GitHub-hosted free; pass `self-hosted` so a private repo (e.g. NERV-es/NERV, whose hosted Actions are billing-blocked) runs on a local runner.
+        type: string
+        default: ubuntu-latest
 
 permissions: {}
 
@@ -65,7 +69,7 @@ jobs:
   # Probe gateway secret presence (can't be read in a job-level `if`). The review
   # job itself is unconditional — GitHub Models needs no key.
   guard:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on }}
     outputs:
       gateway: ${{ steps.probe.outputs.gateway }}
     steps:
@@ -89,7 +93,7 @@ jobs:
       ${{ github.event.pull_request.user.type != 'Bot'
         && (github.repository == 'NERV-es/NERV'
             || github.repository == 'NERV-es/.github') }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 15
     permissions:
       contents: read # checkout + diff
@@ -97,6 +101,7 @@ jobs:
       models: read # free GitHub Models inference
     steps:
       - name: Harden runner
+        if: ${{ inputs.runs_on == 'ubuntu-latest' }}
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: audit
@@ -189,11 +194,12 @@ jobs:
   webhook-out:
     needs: guard
     if: needs.guard.outputs.gateway == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 5
     permissions: {}
     steps:
       - name: Harden runner
+        if: ${{ inputs.runs_on == 'ubuntu-latest' }}
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: audit
