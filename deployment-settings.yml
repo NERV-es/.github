@@ -13,4 +13,5 @@ restrictedRepos:
     - codeburn
     - cotabby
     - meetily
+    - nerv-harness
     - voiceink
