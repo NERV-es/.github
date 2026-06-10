@@ -9,8 +9,6 @@
 # To onboard a new fork: add its name (globs allowed, e.g. "my-fork-*").
 restrictedRepos:
   include:
-    - atoll
-    - codeburn
     - cotabby
     - meetily
     - nerv-harness
