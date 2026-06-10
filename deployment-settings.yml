@@ -1,7 +1,7 @@
 # Runtime scope for github/safe-settings (read locally during full-sync).
 #
 # restrictedRepos.include is an ALLOWLIST: safe-settings manages ONLY the repos
-# listed here and skips everything else in the org. We scope it to the five
+# listed here and skips everything else in the org. We scope it to the
 # PUBLIC forks on purpose — the org also has private repos (NERV,
 # openclaw-config), and branch protection on private repos is paywalled on a
 # free org (returns "Upgrade to GitHub Pro"), which would fail the whole sync.
@@ -11,4 +11,5 @@ restrictedRepos:
   include:
     - cotabby
     - meetily
+    - nerv-harness
     - voiceink
