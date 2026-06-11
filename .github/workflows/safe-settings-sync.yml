@@ -28,16 +28,16 @@ jobs:
       SAFE_SETTINGS_CODE_DIR: ${{ github.workspace }}/.safe-settings-code
     steps:
       # Admin repo checkout (this repo) — provides deployment-settings.yml.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # safe-settings source, pinned to a release tag.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: github/safe-settings
           ref: ${{ env.SAFE_SETTINGS_VERSION }}
           path: .safe-settings-code
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "20"
 
