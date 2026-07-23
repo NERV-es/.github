@@ -11,11 +11,11 @@ jobs:
     name: Agent egress / secret scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           fetch-depth: 0
       - name: Run Pipelock scan
-        uses: luckyPipewrench/pipelock@6d8aaf4a6e8b64d800a3b7d444c924049a9f21d0 # v1.3.0
+        uses: luckyPipewrench/pipelock@3850edb71b054f2ee505c7dc4747ec2101bb8f3d # v3.2.0
         with:
           scan-diff: true
           fail-on-findings: false
