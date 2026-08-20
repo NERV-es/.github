@@ -51,7 +51,7 @@ on:
         type: boolean
         default: true
       reviewer_ref:
-        description: Ref of NERV-es/.github to fetch ai_review.py from (keep in lockstep with the pinned tag).
+        description: Ref of arbitraged-life/.github to fetch ai_review.py from (keep in lockstep with the pinned tag).
         type: string
         default: ai-review-v1
       runs_on:
@@ -115,7 +115,7 @@ jobs:
     #   * issue_comment — an on-demand `/bobby ...` command on a PR (skips bots
     #     so other review bots can't trigger a loop).
     if: >-
-      ${{ (github.repository == 'NERV-es/NERV' || github.repository == 'NERV-es/.github')
+      ${{ contains(fromJSON('["arbitraged-life/.github","arbitraged-life/homelab","arbitraged-life/agent-framework"]'), github.repository)
         && (
           (github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot')
           || (github.event_name == 'issue_comment'
@@ -197,10 +197,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Fetch reviewer script from NERV-es/.github
+      - name: Fetch reviewer script
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: NERV-es/.github
+          repository: arbitraged-life/.github
           ref: ${{ inputs.reviewer_ref }}
           path: .nerv-github
           token: ${{ steps.app-token.outputs.token != '' && steps.app-token.outputs.token || github.token }}
