@@ -1,15 +1,19 @@
 name: AI Review (reusable)
 
-# ONE org-wide AI PR reviewer, hosted here in the PUBLIC NERV-es/.github repo so
-# every repo in the org (public or private) can call it with an 8-line stub:
+# ONE org-wide AI PR reviewer, hosted here in the PUBLIC arbitraged-life/.github
+# repo so every repo in the org (public or private) can call it with an
+# 8-line stub:
 #
 #   jobs:
 #     ai-review:
-#       uses: NERV-es/.github/.github/workflows/ai-review-reusable.yml@ai-review-v1
+#       uses: arbitraged-life/.github/.github/workflows/ai-review-reusable.yml@<sha>
 #       secrets: inherit
 #
 # (The doubled `.github/.github/` is correct: the first is the repo named
-#  `.github`, the second is its workflows dir. Pin to the immutable tag.)
+#  `.github`, the second is its workflows dir. Pin to a commit SHA.)
+#
+# NOTE: a caller must also be added to the `review` job's allowlist below —
+# adding the stub alone is not enough, by design.
 #
 # WHY THIS SHAPE: the org doesn't pay for Copilot. The reviewer (ai_review.py)
 # fans each PR diff out to every LLM whose key is present and posts ONE
@@ -55,7 +59,7 @@ on:
         type: string
         default: ai-review-v1
       runs_on:
-        description: Runner label for every job. Default GitHub-hosted free; pass `self-hosted` so a private repo (e.g. NERV-es/NERV, whose hosted Actions are billing-blocked) runs on a local runner.
+        description: Runner label for every job. Default GitHub-hosted free; pass `self-hosted` so a private repo (e.g. arbitraged-life/homelab, whose hosted Actions are billing-blocked) runs on a local runner.
         type: string
         default: ubuntu-latest
       inline_comments:
@@ -108,14 +112,17 @@ jobs:
           fi
 
   review:
-    # Scope: only NERV + the org .github repo opt in for now. The reusable is
-    # public, so this defensive allowlist stops any other caller from running
-    # reviews until explicitly added here. Two entry points:
+    # Scope: an explicit allowlist of the repos that call THIS copy. The
+    # reusable is public, so this defensive list stops any other caller from
+    # running reviews until explicitly added here — and because this job
+    # inherits every repo secret via `secrets: inherit` and can run on a
+    # self-hosted runner, an entry is a real privilege grant: add one only
+    # alongside the caller workflow that needs it. Two entry points:
     #   * pull_request  — automatic review on open/push (skips bot-authored PRs).
     #   * issue_comment — an on-demand `/bobby ...` command on a PR (skips bots
     #     so other review bots can't trigger a loop).
     if: >-
-      ${{ contains(fromJSON('["arbitraged-life/.github","arbitraged-life/homelab","arbitraged-life/agent-framework"]'), github.repository)
+      ${{ contains(fromJSON('["arbitraged-life/homelab","arbitraged-life/agent-framework"]'), github.repository)
         && (
           (github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot')
           || (github.event_name == 'issue_comment'
@@ -140,13 +147,13 @@ jobs:
       # Mint a short-lived installation token for the org App (bobby-claws,
       # app id NERV_APP_ID). The review comment + peer-context reads are posted
       # AS the App, not github-actions[bot]. The same token also authorizes the
-      # cross-repo checkout of NERV-es/.github below (org-wide contents:read).
+      # cross-repo checkout of arbitraged-life/.github below (org-wide contents:read).
       # NOTE: the App token can't call GitHub Models — inference still uses
       # GH_MODELS_TOKEN (MODELS_TOKEN or the built-in token) further down.
       - name: Generate app token (bobby-claws)
         id: app-token
         # The App creds are ORG secrets, which a FREE org does NOT expose to
-        # PRIVATE repos (same limit as the provider keys). On private NERV-es/NERV
+        # PRIVATE repos (same limit as the provider keys). On a private caller
         # (now on the self-hosted runner) this step therefore can't mint a token;
         # continue-on-error lets the job proceed and fall back to the built-in
         # GITHUB_TOKEN below (posts as github-actions[bot] instead of bobby-claws).
