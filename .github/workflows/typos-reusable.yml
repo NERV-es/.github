@@ -2,6 +2,15 @@ name: Typos (reusable)
 
 on:
   workflow_call:
+    inputs:
+      config:
+        description: Path to a typos config file. Omit to use crate-ci/typos' own auto-discovery.
+        type: string
+        default: ''
+      harden_runner:
+        description: Run step-security/harden-runner first.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -11,6 +20,13 @@ jobs:
     name: Spell check
     runs-on: ubuntu-latest
     steps:
+      - name: Harden Runner
+        if: inputs.harden_runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Check spelling
         uses: crate-ci/typos@f8a58b6b53f2279f71eb605f03a4ae4d10608f45 # v1.47.0
+        with:
+          config: ${{ inputs.config }}
