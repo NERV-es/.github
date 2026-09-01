@@ -5,6 +5,15 @@ name: CI Optimizer (reusable)
 
 on:
   workflow_call:
+    inputs:
+      runs_on:
+        description: Runner label. Default GitHub-hosted free; pass `self-hosted` for a private repo with billing-blocked hosted Actions.
+        type: string
+        default: ubuntu-latest
+      harden_runner:
+        description: Run step-security/harden-runner first (only meaningful on GitHub-hosted runners; self-hosted runners typically manage their own egress policy).
+        type: boolean
+        default: false
 
 permissions:
   actions: write
@@ -13,10 +22,15 @@ permissions:
 jobs:
   optimize:
     name: Skip duplicate / cancel outdated runs
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on }}
     steps:
+      - name: Harden Runner
+        if: inputs.harden_runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
       - id: skip
-        uses: fkirc/skip-duplicate-actions@f75f66ce1886f00957d99748a42c724f4330bdcf # v5
+        uses: fkirc/skip-duplicate-actions@f75f66ce1886f00957d99748a42c724f4330bdcf # v5.3.1
         with:
           cancel_others: 'true'
           concurrent_skipping: 'outdated_runs'

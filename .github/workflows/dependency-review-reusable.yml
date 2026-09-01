@@ -15,6 +15,14 @@ on:
         description: Head ref to compare. Defaults to the PR head branch.
         type: string
         required: false
+      comment-summary-in-pr:
+        description: When to post the PR summary comment (always|on-failure|never).
+        type: string
+        default: on-failure
+      harden_runner:
+        description: Run step-security/harden-runner first.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -24,6 +32,11 @@ jobs:
   dependency-review:
     runs-on: ubuntu-latest
     steps:
+      - name: Harden Runner
+        if: inputs.harden_runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Dependency Review
@@ -32,5 +45,5 @@ jobs:
           fail-on-severity: ${{ inputs.fail-on-severity }}
           base-ref: ${{ inputs.base-ref }}
           head-ref: ${{ inputs.head-ref }}
-          comment-summary-in-pr: on-failure
+          comment-summary-in-pr: ${{ inputs.comment-summary-in-pr }}
           warn-only: false
